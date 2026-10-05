@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.5.3
+
+HA / MobiLink diagnostics and Option 14 parity release.
+
+- Preserve the original broad Option 14 health-check intent while adding HA-specific diagnostics.
+- Detect local IX Messaging role from installed services and refine topology from `DBA.LocationNodes`.
+- Add role-aware checks for `MobiLink - Consolidated` and `SQL Anywhere - MobiLink Remote`.
+- Report service state, startup type, Log On As identity, PID, process start time, and executable path.
+- Correlate Service Control Manager startup, dependency, timeout, unexpected-termination, and credential/logon failures.
+- Discover `Mobiclient.log` across documented and alternate UC paths.
+- Use `Completed processing of download stream` as the documented file-sync success marker and report synchronization age.
+- Add HEALTHY / WARNING / FAILED / UNKNOWN HA summary logic.
+- Add Avaya Messaging 11.0 SP2 initial-sync guidance and the release-specific 10-day Primary-to-Consolidated recovery-window note.
+- Restore explicit DBWatcher and UCArchiver checks from the original health check.
+- Restore compact running/stopped UC-service and SQL Anywhere service summaries.
+- Restore the last 20 DTMF buffer entries.
+- Make ActiveSubscriptions guidance Primary-Consolidated-aware, including expected 1900-era upload timestamps for applicable topology entries.
+- Treat confirmed single-server deployments as HA/MobiLink NOT APPLICABLE.
+- Fix Windows PowerShell 5.1 `Sort-Object` syntax in the first 2.5.3 build.
+- Fix Windows PowerShell 5.1 generic-list `Argument types do not match` handling in HA service/event collections.
+
 ## 2.5.2
 
 Audit / production hardening release.
