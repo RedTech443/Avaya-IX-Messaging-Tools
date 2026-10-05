@@ -6,24 +6,14 @@ Private troubleshooting and health-check toolkit for Avaya IX Messaging.
 
 **Version 2.5.3**
 
-Current stable script:
+Repository contents:
 
-- `IXM-Tools.ps1`
+- `IXM-Tools.ps1` — current PowerShell tool
+- `README.md` — project overview
+- `CHANGELOG.md` — release history
+- `docs/User_Guide_v2.5.3.md` — current user guide
 
-Versioned release:
-
-- `IXM-Tools-v2.5.3.ps1`
-
-Audit / verification files:
-
-- `PSScriptAnalyzerSettings.psd1`
-- `PSScriptAnalyzerSettings-v2.5.3.psd1`
-- `IXM-Tools-v2.5.3.ps1.sha256.txt`
-
-Documentation:
-
-- `docs/User_Guide_v2.5.3.md`
-- Previous guides/releases remain in the repository for reference.
+Older versioned scripts, checksums, analyzer settings, and older guides are intentionally not retained in the repository.
 
 ## Requirements
 
@@ -138,28 +128,10 @@ Most reports can be exported to CSV. The tool warns when customer data may be ex
 
 When the Save As dialog is unavailable, the fallback location is user-scoped under Local AppData (or Documents/TEMP as a final fallback), rather than `C:\Temp`.
 
-## PSScriptAnalyzer
-
-Run the audit with:
-
-```powershell
-Invoke-ScriptAnalyzer `
-    -Path ".\IXM-Tools-v2.5.3.ps1" `
-    -Settings ".\PSScriptAnalyzerSettings.psd1"
-```
-
-The settings suppress intentional interactive-UI/naming rules while leaving correctness/security-related warnings enabled.
-
-## SHA-256
-
-The published checksum for `IXM-Tools-v2.5.3.ps1` is stored in:
-
-`IXM-Tools-v2.5.3.ps1.sha256.txt`
-
 ## Notes
 
 Results are limited by available log retention. Missing or rotated logs are not evidence that an event never occurred.
 
 Health-check thresholds are diagnostic thresholds used by this utility and are not Avaya support policy.
 
-This repository is private and intended for internal troubleshooting/development use.
+This repository is intentionally kept minimal and contains only the current script, README, changelog, and current user guide.
