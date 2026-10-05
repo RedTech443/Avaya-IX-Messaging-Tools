@@ -1,4 +1,4 @@
-#requires -version 5.1
+﻿#requires -version 5.1
 
 <#
 .SYNOPSIS
@@ -81,6 +81,36 @@
       - Database wording now distinguishes application-enforced SELECT-only SQL
         from the permissions granted to the configured SQL Anywhere account.
 
+    Version 2.5.3 expands the system health check with role-aware IX Messaging
+    HA / MobiLink diagnostics:
+      - Detects Consolidated versus Voice-server roles without hard-coded hostnames
+        and refines Primary/Secondary role from DBA.LocationNodes when available.
+      - Verifies role-specific MobiLink, SQL Anywhere, DBWatcher, and related UC
+        services with state, startup mode, logon identity, PID, process start time,
+        executable path, and service-account correlation.
+      - Reviews recent Service Control Manager failures, including logon/password,
+        startup, dependency, timeout, and unexpected-termination evidence.
+      - Discovers Mobiclient.log across documented and alternate UC paths, reports
+        recent successful download-stream markers, sync age, and recent errors.
+      - Produces HEALTHY / WARNING / FAILED / UNKNOWN HA status without equating a
+        running MobiLink service by itself with successful synchronization.
+      - Incorporates Avaya Messaging 11.0 SP2 HA guidance: page 203's initial
+        synchronization warning and documented success marker, plus the HA chapter's
+        10-day Primary-to-Consolidated synchronization recovery window. These are
+        presented as operational guidance and do not change the tool's diagnostic
+        30-minute sync-freshness threshold.
+      - Fixes the Windows PowerShell 5.1 Sort-Object syntax used by the service-account
+        summary in the first 2.5.3 build.
+      - Fixes Windows PowerShell 5.1 generic-list array conversion in the HA service
+        inventory path (prevents runtime 'Argument types do not match').
+      - Restores original health-check parity for DBWatcher/UCArchiver, broad SQL
+        Anywhere and UC-service status review, and the last 20 DTMF buffer entries.
+      - Keeps ActiveSubscriptions as a Primary Consolidated diagnostic and restores
+        the original guidance that some CSE/Web/Report/consolidated-remote upload
+        timestamps can legitimately remain at 1900-01-01 depending on topology.
+      - Refines topology before role-specific service checks so a true single-server
+        installation is not incorrectly failed for missing HA/MobiLink components.
+
     Authenticode signing is a deployment control and is not added automatically.
     For audited customer deployments, sign the release with the organization's
     code-signing certificate and use a SQL Anywhere identity limited to SELECT.
@@ -99,7 +129,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # -----------------------------------------------------------------------------
 
-$ToolVersion = '2.5.2'
+$ToolVersion = '2.5.3'
 $LogRoot = 'X:\UC\logs\VServer'
 
 # CSV fallback is intentionally user-scoped rather than a shared C:\Temp path.
@@ -997,7 +1027,8 @@ function Get-MWIEvents {
     }
 
     $Events = @(
-        Get-AllMWIEvents -StartDate $StartDate -EndDate $EndDate |        Where-Object { $_.Extension -eq $Extension }
+        Get-AllMWIEvents -StartDate $StartDate -EndDate $EndDate |
+        Where-Object { $_.Extension -eq $Extension }
     )
 
     $script:MWICache[$CacheKey] = $Events
@@ -1996,7 +2027,8 @@ function Test-IxmMailboxSchema {
 function Select-IxmDatabaseDsn {
     $AllCandidates = @(Get-SystemSqlAnywhereDsns)
 
-    if ($AllCandidates.Count -eq 0) {        throw 'No SQL Anywhere System DSNs were found on this server.'
+    if ($AllCandidates.Count -eq 0) {
+        throw 'No SQL Anywhere System DSNs were found on this server.'
     }
 
     # Do not connect to every SQL Anywhere DSN on the host. Restrict automatic
@@ -2995,7 +3027,8 @@ function Resolve-CseGraphRoot {
             Select-Object -ExpandProperty DeviceID
         )
     }
-    catch {        $Drives = @(
+    catch {
+        $Drives = @(
             Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
             ForEach-Object { $_.Root.TrimEnd('\') }
         )
@@ -3994,7 +4027,8 @@ function Show-GraphFailureAudit {
         Where-Object { $_.Priority -eq 'MONITOR' }
     )
 
-    if ($ActionRows.Count -gt 0) {        Write-Host ''
+    if ($ActionRows.Count -gt 0) {
+        Write-Host ''
         Write-Host 'ACTION / INVESTIGATION' -ForegroundColor Cyan
         Write-Host ('-' * 78)
 
@@ -4260,6 +4294,38 @@ function Resolve-IxmUcRoot {
         }
     }
 
+    # Third preference: derive the UC root from installed Avaya/SQL Anywhere
+    # service executable paths. This helps when the VServer log root or uninstall
+    # metadata is unavailable or the UC drive letter differs from the default.
+    try {
+        $ServiceRoots = New-Object System.Collections.Generic.List[string]
+        foreach ($Svc in @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue)) {
+            $Display = [string]$Svc.DisplayName
+            $Name = [string]$Svc.Name
+            $Path = [string]$Svc.PathName
+
+            if ([string]::IsNullOrWhiteSpace($Path)) { continue }
+            if ($Display -notmatch '(?i)^(UC|SQL Anywhere|MobiLink|DBWatcher)' -and
+                $Name -notmatch '(?i)^(UC|SQL Anywhere|MobiLink|DBWatcher)') {
+                continue
+            }
+
+            if ($Path -match '(?i)(?<Root>[A-Z]:\\(?:[^\\"]+\\)*UC)(?:\\|")') {
+                $Candidate = $Matches.Root
+                if ((Test-Path -LiteralPath $Candidate) -and -not $ServiceRoots.Contains($Candidate)) {
+                    $ServiceRoots.Add($Candidate)
+                }
+            }
+        }
+
+        if ($ServiceRoots.Count -eq 1) {
+            return $ServiceRoots[0]
+        }
+    }
+    catch {
+        Write-Verbose ('Unable to derive the UC root from Windows service paths: {0}' -f $_.Exception.Message)
+    }
+
     # Last automatic attempt: local fixed drives.
     $Found = New-Object System.Collections.Generic.List[string]
 
@@ -4517,7 +4583,9 @@ function Get-IxmHealthRegistryAndSystem {
         if ($UsedPct -ge 95) { $Status = 'ATTENTION' }
         elseif ($UsedPct -ge 85) { $Status = 'WARNING' }
 
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Physical memory used' -Value ('{0:N2}%' -f $UsedPct) -Status $Status
+        $TotalGb = ($TotalKb * 1KB) / 1GB
+        $FreeGb = ($FreeKb * 1KB) / 1GB
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Physical memory used' -Value ('{0:N2}%' -f $UsedPct) -Status $Status -Details ('Total={0:N1} GB; Free={1:N1} GB' -f $TotalGb,$FreeGb)
     }
     catch {
         Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Physical memory used' -Value 'Unavailable' -Status 'INFO' -Details $_.Exception.Message
@@ -4576,95 +4644,761 @@ function Get-IxmHealthRegistryAndSystem {
     }
 }
 
-function Get-IxmHealthServices {
-    param([Parameter(Mandatory)]$Findings)
+function Get-IxmServiceInventory {
+    try {
+        return @(
+            Get-CimInstance Win32_Service -ErrorAction Stop |
+            Sort-Object DisplayName,Name
+        )
+    }
+    catch {
+        Write-Verbose ('Unable to inventory Win32_Service through CIM: {0}' -f $_.Exception.Message)
+        return @()
+    }
+}
 
-    $Section = 'Services'
+function Test-IxmBuiltInServiceAccount {
+    param([AllowNull()][string]$StartName)
 
-    $ServiceChecks = @(
-        [pscustomobject]@{ Label='SQL Anywhere'; Pattern='SQL Anywhere*'; Required=$true },
-        [pscustomobject]@{ Label='DBWatcher'; Pattern='DBWatcher'; Required=$true },
-        [pscustomobject]@{ Label='UCArchiver'; Pattern='UCArchiver'; Required=$true }
+    if ([string]::IsNullOrWhiteSpace([string]$StartName)) { return $false }
+
+    return ($StartName -match '(?i)^(LocalSystem|NT AUTHORITY\\(?:LocalService|NetworkService)|LocalService|NetworkService)$')
+}
+
+function Get-IxmServiceProcessStartTime {
+    param($Service)
+
+    if ($null -eq $Service -or [int]$Service.ProcessId -le 0) { return $null }
+
+    try {
+        return (Get-Process -Id ([int]$Service.ProcessId) -ErrorAction Stop).StartTime
+    }
+    catch {
+        return $null
+    }
+}
+
+function New-IxmHaContext {
+    param([Parameter(Mandatory)][object[]]$ServiceInventory)
+
+    $HostName = try { [System.Net.Dns]::GetHostName() } catch { $env:COMPUTERNAME }
+
+    $Consolidated = @(
+        $ServiceInventory | Where-Object {
+            [string]$_.DisplayName -match '(?i)^MobiLink\s*-\s*Consolidated$' -or
+            [string]$_.Name -match '(?i)^MobiLink\s*-\s*Consolidated$'
+        }
     )
 
-    foreach ($Check in $ServiceChecks) {
-        try {
-            $Services = @(
-                Get-Service -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName -like $Check.Pattern -or $_.Name -like $Check.Pattern }
-            )
+    $Remote = @(
+        $ServiceInventory | Where-Object {
+            [string]$_.DisplayName -match '(?i)^SQL Anywhere[-\s]*MobiLink\s+Remote$' -or
+            [string]$_.Name -match '(?i)^SQL Anywhere[-\s]*MobiLink\s+Remote$'
+        }
+    )
 
-            if ($Services.Count -eq 0) {
-                $Status = if ($Check.Required) { 'ATTENTION' } else { 'NOT APPLICABLE' }
-                Add-IxmHealthFinding -List $Findings -Section $Section -Check $Check.Label -Value 'Not found' -Status $Status
-                continue
+    $Listener = @(
+        $ServiceInventory | Where-Object {
+            [string]$_.DisplayName -match '(?i)^SQL Anywhere[-\s]*MobiLinkListener$' -or
+            [string]$_.Name -match '(?i)^SQL Anywhere[-\s]*MobiLinkListener$'
+        }
+    )
+
+    $Voice = @(
+        $ServiceInventory | Where-Object {
+            [string]$_.DisplayName -match '(?i)^UC\s*Voice\s*Server$' -or
+            [string]$_.Name -match '(?i)^UCVoiceServer$'
+        }
+    )
+
+    $Role = 'Unknown'
+    $RoleSource = 'Installed Windows services'
+
+    if ($Consolidated.Count -gt 0 -and $Remote.Count -eq 0) {
+        $Role = 'Consolidated Server'
+    }
+    elseif ($Remote.Count -gt 0 -or $Listener.Count -gt 0 -or $Voice.Count -gt 0) {
+        $Role = 'Voice Server (Primary/Secondary)'
+    }
+    elseif ($Consolidated.Count -gt 0) {
+        $Role = 'Consolidated Server'
+    }
+
+    return [pscustomobject]@{
+        HostName = $HostName
+        Role = $Role
+        RoleSource = $RoleSource
+        ServiceInventory = @($ServiceInventory)
+        RelevantServices = @()
+        RequiredServiceIssues = (New-Object System.Collections.Generic.List[string])
+        AccountWarnings = (New-Object System.Collections.Generic.List[string])
+        ServiceEvents = (New-Object System.Collections.Generic.List[object])
+        MobiclientLogPath = ''
+        MobiclientLogFound = $false
+        MobiclientFileLastWrite = $null
+        SyncMarkerCount = 0
+        LastSyncSuccess = $null
+        SyncAge = $null
+        SyncIsRecent = $false
+        RecentSyncLines = @()
+        RecentLogErrors = @()
+        LastLogFailure = $null
+        OverallStatus = 'UNKNOWN'
+        OverallReason = ''
+    }
+}
+
+function Get-IxmHaServiceDefinitions {
+    param([Parameter(Mandatory)][string]$Role)
+
+    $CommonDb = [pscustomobject]@{
+        Label = 'SQL Anywhere IXM database'
+        Regex = '(?i)^SQL Anywhere[-\s]*(?:ASADB_UC|USADB_UC)$'
+        Critical = $true
+    }
+
+    if ($Role -match 'Consolidated') {
+        return @(
+            [pscustomobject]@{ Label='MobiLink - Consolidated'; Regex='(?i)^MobiLink\s*-\s*Consolidated$'; Critical=$true },
+            $CommonDb,
+            [pscustomobject]@{ Label='DBWatcher'; Regex='(?i)^DBWatcher$'; Critical=$true },
+            [pscustomobject]@{ Label='UC VPIMServer'; Regex='(?i)^UC\s*VPIMServer$|^UCVPIMServer$'; Critical=$false },
+            [pscustomobject]@{ Label='UC Unified Messaging System Tasks Service'; Regex='(?i)^UC\s*Unified Messaging System Tasks Service$'; Critical=$false },
+            [pscustomobject]@{ Label='UC Background Task Manager'; Regex='(?i)^UC\s*Background Task Manager$'; Critical=$false },
+            [pscustomobject]@{ Label='UC Background File Organizer'; Regex='(?i)^UC\s*Background File Organizer$'; Critical=$false },
+            [pscustomobject]@{ Label='UC Business Layer Service'; Regex='(?i)^UC\s*Business Layer Service$'; Critical=$false },
+            [pscustomobject]@{ Label='UC Service Recovery Manager'; Regex='(?i)^UC\s*Service Recovery Manager$'; Critical=$false }
+        )
+    }
+
+    if ($Role -match 'Voice Server') {
+        return @(
+            [pscustomobject]@{ Label='SQL Anywhere-MobiLink Remote'; Regex='(?i)^SQL Anywhere[-\s]*MobiLink\s+Remote$'; Critical=$true },
+            [pscustomobject]@{ Label='SQL Anywhere-MobiLinkListener'; Regex='(?i)^SQL Anywhere[-\s]*MobiLinkListener$'; Critical=$true },
+            $CommonDb,
+            [pscustomobject]@{ Label='DBWatcher'; Regex='(?i)^DBWatcher$'; Critical=$true },
+            [pscustomobject]@{ Label='UC Voice Server'; Regex='(?i)^UC\s*Voice\s*Server$|^UCVoiceServer$'; Critical=$false },
+            [pscustomobject]@{ Label='UC Background Task Manager'; Regex='(?i)^UC\s*Background Task Manager$'; Critical=$false },
+            [pscustomobject]@{ Label='UC Background File Organizer'; Regex='(?i)^UC\s*Background File Organizer$'; Critical=$false },
+            [pscustomobject]@{ Label='UC Business Layer Service'; Regex='(?i)^UC\s*Business Layer Service$'; Critical=$false }
+        )
+    }
+
+    # Unknown role: discover both MobiLink families but do not mark role-specific
+    # services missing. Database and DBWatcher are still worth reporting.
+    return @(
+        [pscustomobject]@{ Label='MobiLink - Consolidated'; Regex='(?i)^MobiLink\s*-\s*Consolidated$'; Critical=$false },
+        [pscustomobject]@{ Label='SQL Anywhere-MobiLink Remote'; Regex='(?i)^SQL Anywhere[-\s]*MobiLink\s+Remote$'; Critical=$false },
+        [pscustomobject]@{ Label='SQL Anywhere-MobiLinkListener'; Regex='(?i)^SQL Anywhere[-\s]*MobiLinkListener$'; Critical=$false },
+        [pscustomobject]@{ Label='SQL Anywhere IXM database'; Regex='(?i)^SQL Anywhere[-\s]*(?:ASADB_UC|USADB_UC)$'; Critical=$false },
+        [pscustomobject]@{ Label='DBWatcher'; Regex='(?i)^DBWatcher$'; Critical=$false },
+        [pscustomobject]@{ Label='UC Voice Server'; Regex='(?i)^UC\s*Voice\s*Server$|^UCVoiceServer$'; Critical=$false }
+    )
+}
+
+function Confirm-IxmHaCriticalServicesForRefinedRole {
+    param(
+        [Parameter(Mandatory)]$Findings,
+        [Parameter(Mandatory)]$HaContext
+    )
+
+    if ([string]$HaContext.Role -eq 'Unknown') { return }
+
+    $Section = 'HA / MobiLink Services'
+    $Services = @($HaContext.ServiceInventory)
+    $Definitions = @(Get-IxmHaServiceDefinitions -Role ([string]$HaContext.Role) | Where-Object { $_.Critical })
+
+    foreach ($Definition in $Definitions) {
+        $Found = @(
+            $Services | Where-Object {
+                [string]$_.DisplayName -match $Definition.Regex -or [string]$_.Name -match $Definition.Regex
+            }
+        )
+
+        if ($Found.Count -eq 0) {
+            $Issue = '{0}: MISSING' -f $Definition.Label
+            if (-not $HaContext.RequiredServiceIssues.Contains($Issue)) {
+                $HaContext.RequiredServiceIssues.Add($Issue)
+                Add-IxmHealthFinding -List $Findings -Section $Section -Check ('{0} (role refinement)' -f $Definition.Label) -Value 'MISSING' -Status 'ATTENTION' -Details ('Required after the local role was refined to {0}.' -f $HaContext.Role)
+            }
+            continue
+        }
+
+        foreach ($Svc in $Found) {
+            $State = [string]$Svc.State
+            $StartMode = [string]$Svc.StartMode
+            $DisplayState = $State.ToUpperInvariant()
+            if ($StartMode -match '(?i)disabled') { $DisplayState = 'DISABLED' }
+
+            if ($StartMode -match '(?i)disabled' -or $State -ne 'Running') {
+                $Issue = '{0}: {1}' -f $Definition.Label,$DisplayState
+                if (-not $HaContext.RequiredServiceIssues.Contains($Issue)) {
+                    $HaContext.RequiredServiceIssues.Add($Issue)
+                    Add-IxmHealthFinding -List $Findings -Section $Section -Check ('{0} (role refinement)' -f $Definition.Label) -Value $DisplayState -Status 'ATTENTION' -Details ('Required after the local role was refined to {0}; DisplayName="{1}"; ServiceName="{2}"; Startup={3}; LogOnAs={4}' -f $HaContext.Role,$Svc.DisplayName,$Svc.Name,$StartMode,$Svc.StartName)
+                }
+            }
+        }
+    }
+}
+
+function Update-IxmHaRoleFromDatabase {
+    param(
+        [Parameter(Mandatory)]$Findings,
+        [Parameter(Mandatory)]$Connection,
+        [Parameter(Mandatory)]$HaContext
+    )
+
+    $Result = Invoke-IxmHealthSql -Connection $Connection -Sql @"
+SELECT ServerName, ServerType
+FROM DBA.LocationNodes
+ORDER BY ServerName
+"@
+
+    if (-not $Result.Success) {
+        Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink' -Check 'Role refinement' -Value 'Database lookup unavailable' -Status 'INFO' -Details $Result.Error
+        return
+    }
+
+    $ShortHost = ([string]$HaContext.HostName).Split('.')[0]
+    $Candidates = @(
+        $Result.Rows | Where-Object {
+            if ($_.IsNull('ServerName')) { return $false }
+            $ServerName = [string]$_.ServerName
+            $ServerShort = $ServerName.Split('.')[0]
+            return ($ServerName -ieq [string]$HaContext.HostName -or $ServerShort -ieq $ShortHost)
+        }
+    )
+
+    if ($Candidates.Count -eq 0) {
+        Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink' -Check 'Role refinement' -Value 'Local hostname not found in LocationNodes' -Status 'INFO' -Details ('Host: {0}; service-derived role remains {1}' -f $HaContext.HostName,$HaContext.Role)
+        return
+    }
+
+    $Type = $null
+    try { $Type = [int]$Candidates[0].ServerType } catch { $Type = $null }
+
+    $RoleMap = @{
+        1 = 'Primary Voice Server'
+        2 = 'Secondary Voice Server'
+        4 = 'Primary Consolidated Server'
+        8 = 'Secondary Consolidated Server'
+    }
+
+    $PrimaryConsolidatedCount = @(
+        $Result.Rows | Where-Object {
+            -not $_.IsNull('ServerType') -and [int]$_.ServerType -eq 4
+        }
+    ).Count
+
+    if ($Type -eq 1 -and $PrimaryConsolidatedCount -eq 0) {
+        $HaContext.Role = 'Single Server (Primary Voice)'
+        $HaContext.RoleSource = 'DBA.LocationNodes / original topology rule'
+        Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink' -Check 'Role refinement' -Value $HaContext.Role -Status 'INFO' -Details ('Matched local host {0} to ServerType 1 and found no ServerType 4 Primary Consolidated node. HA/MobiLink synchronization requirements are not applied to this topology.' -f $HaContext.HostName)
+    }
+    elseif ($null -ne $Type -and $RoleMap.ContainsKey($Type)) {
+        $HaContext.Role = $RoleMap[$Type]
+        $HaContext.RoleSource = 'DBA.LocationNodes'
+        Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink' -Check 'Role refinement' -Value $HaContext.Role -Status 'OK' -Details ('Matched local host {0} to ServerType {1} in DBA.LocationNodes.' -f $HaContext.HostName,$Type)
+    }
+    else {
+        Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink' -Check 'Role refinement' -Value 'LocationNodes match found, role not mapped' -Status 'INFO' -Details ('ServerType={0}' -f $Type)
+    }
+}
+
+function Get-IxmTimestampFromLogLine {
+    param([AllowEmptyString()][string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+
+    $Patterns = @(
+        '(?<Stamp>\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)',
+        '(?<Stamp>\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)',
+        '(?<Stamp>\d{8}\s+\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)'
+    )
+
+    foreach ($Pattern in $Patterns) {
+        if ($Line -match $Pattern) {
+            $Stamp = $Matches.Stamp
+            $Parsed = [datetime]::MinValue
+            if ([datetime]::TryParse($Stamp,[ref]$Parsed)) {
+                return $Parsed
             }
 
-            $Stopped = @($Services | Where-Object { $_.Status -ne 'Running' })
-            if ($Stopped.Count -eq 0) {
-                Add-IxmHealthFinding -List $Findings -Section $Section -Check $Check.Label -Value ('{0} service(s) running' -f $Services.Count) -Status 'OK'
+            if ($Stamp -match '^\d{8}\s') {
+                foreach ($Format in @('yyyyMMdd HH:mm:ss.fff','yyyyMMdd HH:mm:ss')) {
+                    if ([datetime]::TryParseExact(
+                        $Stamp,
+                        $Format,
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [System.Globalization.DateTimeStyles]::None,
+                        [ref]$Parsed
+                    )) {
+                        return $Parsed
+                    }
+                }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-IxmHaServiceEvents {
+    param(
+        [Parameter(Mandatory)]$Findings,
+        [Parameter(Mandatory)]$HaContext,
+        [int]$Days = 7
+    )
+
+    $Section = 'HA / Service Events'
+    $Since = (Get-Date).AddDays(-$Days)
+
+    try {
+        $Events = @(
+            Get-WinEvent -FilterHashtable @{
+                LogName = 'System'
+                ProviderName = 'Service Control Manager'
+                StartTime = $Since
+            } -MaxEvents 2000 -ErrorAction Stop
+        )
+    }
+    catch {
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Service Control Manager' -Value 'Event-log check unavailable' -Status 'INFO' -Details $_.Exception.Message
+        return
+    }
+
+    $RelevantTokens = New-Object System.Collections.Generic.List[string]
+    foreach ($Svc in $HaContext.RelevantServices) {
+        foreach ($Token in @([string]$Svc.DisplayName,[string]$Svc.Name)) {
+            if (-not [string]::IsNullOrWhiteSpace($Token) -and -not $RelevantTokens.Contains($Token)) {
+                $RelevantTokens.Add($Token)
+            }
+        }
+    }
+
+    $FailureIdSet = @(7000,7001,7009,7011,7022,7023,7024,7031,7034,7038,7041)
+    $Matches = New-Object System.Collections.Generic.List[object]
+
+    foreach ($Event in $Events) {
+        $Message = [string]$Event.Message
+        if ([string]::IsNullOrWhiteSpace($Message)) { continue }
+
+        $Relevant = ($Message -match '(?i)MobiLink|SQL Anywhere|DBWatcher|UC\s+(?:Voice|Background|Business|VPIM|Unified Messaging|Service Recovery)')
+        if (-not $Relevant) {
+            foreach ($Token in $RelevantTokens) {
+                if ($Message.IndexOf($Token,[System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $Relevant = $true
+                    break
+                }
+            }
+        }
+        if (-not $Relevant) { continue }
+
+        $FailureText = ($Message -match '(?i)logon|log on|password|user name|account|failed|failure|could not start|cannot start|dependency|timed out|timeout|terminated unexpectedly|unexpectedly terminated')
+        if (($FailureIdSet -notcontains [int]$Event.Id) -and -not $FailureText) { continue }
+
+        $Credential = ([int]$Event.Id -in @(7038,7041) -or $Message -match '(?i)logon|log on|password|user name|account.*(?:failed|failure)|failed.*account')
+        $StartFailure = ([int]$Event.Id -in @(7000,7001,7009,7011,7022,7023,7024) -or $Message -match '(?i)failed to start|could not start|cannot start|dependency|timed out|timeout')
+
+        $ServiceLabel = 'IX Messaging service'
+        foreach ($Token in $RelevantTokens) {
+            if ($Message.IndexOf($Token,[System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $ServiceLabel = $Token
+                break
+            }
+        }
+
+        $OneLine = ($Message -replace '[\r\n]+',' ' -replace '\s+',' ').Trim()
+        if ($OneLine.Length -gt 320) { $OneLine = $OneLine.Substring(0,320) + '...' }
+
+        $Obj = [pscustomobject]@{
+            TimeCreated = $Event.TimeCreated
+            Id = [int]$Event.Id
+            Service = $ServiceLabel
+            CredentialFailure = $Credential
+            StartFailure = $StartFailure
+            Message = $OneLine
+        }
+        $Matches.Add($Obj)
+        $HaContext.ServiceEvents.Add($Obj)
+    }
+
+    $Recent = @($Matches | Sort-Object TimeCreated -Descending | Select-Object -First 10)
+    if ($Recent.Count -eq 0) {
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'SCM startup / logon failures' -Value ('0 relevant in last {0} day(s)' -f $Days) -Status 'OK'
+        return
+    }
+
+    foreach ($Event in $Recent) {
+        $Kind = if ($Event.CredentialFailure) { 'START FAILURE / CREDENTIAL' } elseif ($Event.StartFailure) { 'START FAILURE' } else { 'SERVICE FAILURE' }
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check ('SCM {0} - {1}' -f $Event.Id,$Event.Service) -Value $Kind -Status 'WARNING' -Details ('{0:MM/dd/yyyy HH:mm:ss} - {1}' -f $Event.TimeCreated,$Event.Message)
+    }
+}
+
+function Add-IxmHaOverallFinding {
+    param(
+        [Parameter(Mandatory)]$Findings,
+        [Parameter(Mandatory)]$HaContext
+    )
+
+    $Now = Get-Date
+    $RequiredFailed = ($HaContext.RequiredServiceIssues.Count -gt 0)
+    $LastSync = $HaContext.LastSyncSuccess
+
+    $FailureTimes = New-Object System.Collections.Generic.List[datetime]
+    foreach ($Event in $HaContext.ServiceEvents) {
+        if (($Event.CredentialFailure -or $Event.StartFailure) -and $null -ne $Event.TimeCreated) {
+            $FailureTimes.Add([datetime]$Event.TimeCreated)
+        }
+    }
+    if ($null -ne $HaContext.LastLogFailure) {
+        $FailureTimes.Add([datetime]$HaContext.LastLogFailure)
+    }
+
+    $LastFailure = $null
+    if ($FailureTimes.Count -gt 0) {
+        $LastFailure = @($FailureTimes | Sort-Object -Descending | Select-Object -First 1)[0]
+    }
+
+    $FailureAfterSuccess = ($null -ne $LastFailure -and ($null -eq $LastSync -or $LastFailure -gt $LastSync))
+
+    if ([string]$HaContext.Role -match '^Single Server') {
+        $HaContext.OverallStatus = 'NOT APPLICABLE'
+        $HaContext.OverallReason = 'No Primary Consolidated node was detected; this server is treated as a single-server topology and HA/MobiLink synchronization status does not apply.'
+    }
+    elseif ($RequiredFailed) {
+        $HaContext.OverallStatus = 'FAILED'
+        $HaContext.OverallReason = ('Required HA/MobiLink service issue(s): {0}' -f ($HaContext.RequiredServiceIssues -join '; '))
+    }
+    elseif ($FailureAfterSuccess -and $null -ne $LastFailure) {
+        $HaContext.OverallStatus = 'FAILED'
+        $HaContext.OverallReason = ('A service/log failure at {0:MM/dd/yyyy HH:mm:ss} is newer than the last confirmed successful synchronization.' -f $LastFailure)
+    }
+    elseif ($HaContext.MobiclientLogFound -and $HaContext.SyncIsRecent) {
+        $HaContext.OverallStatus = 'HEALTHY'
+        if ($null -ne $LastFailure) {
+            $HaContext.OverallReason = ('Required services are running and synchronization succeeded after the most recent recorded failure ({0:MM/dd/yyyy HH:mm:ss}).' -f $LastFailure)
+        }
+        else {
+            $HaContext.OverallReason = 'Required services are running and recent successful MobiLink synchronization is confirmed from Mobiclient.log.'
+        }
+    }
+    elseif ($HaContext.MobiclientLogFound -and $HaContext.SyncMarkerCount -gt 0) {
+        $HaContext.OverallStatus = 'WARNING'
+        $HaContext.OverallReason = 'Successful synchronization markers exist, but the most recent success is stale or its timestamp could not be parsed.'
+    }
+    elseif (-not $HaContext.MobiclientLogFound -and $HaContext.Role -ne 'Unknown') {
+        $HaContext.OverallStatus = 'WARNING'
+        $HaContext.OverallReason = 'Required services do not show a current failure, but sync status cannot be verified because the documented Mobiclient.log was not found.'
+    }
+    elseif ($HaContext.Role -eq 'Unknown') {
+        $HaContext.OverallStatus = 'UNKNOWN'
+        $HaContext.OverallReason = 'The local IX Messaging HA role could not be determined with enough confidence to prove synchronization health.'
+    }
+    else {
+        $HaContext.OverallStatus = 'UNKNOWN'
+        $HaContext.OverallReason = 'There is not enough evidence to prove current HA synchronization status.'
+    }
+
+    $StatusMap = @{
+        HEALTHY = 'OK'
+        WARNING = 'WARNING'
+        FAILED = 'ATTENTION'
+        UNKNOWN = 'INFO'
+        'NOT APPLICABLE' = 'NOT APPLICABLE'
+    }
+
+    Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Summary' -Check 'Server' -Value ([string]$HaContext.HostName) -Status 'INFO'
+    Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Summary' -Check 'Detected role' -Value ([string]$HaContext.Role) -Status 'INFO' -Details ('Source: {0}' -f $HaContext.RoleSource)
+    Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Summary' -Check 'OVERALL HA STATUS' -Value $HaContext.OverallStatus -Status $StatusMap[$HaContext.OverallStatus] -Details $HaContext.OverallReason
+
+    # Avaya Messaging Server Installation Guide 11.0 SP2, HA chapter.
+    # Page 203 documents the role-specific synchronization services, DB\Logs\Mobiclient.log,
+    # and the successful-sync marker below. Page 138 documents a 10-day recovery window
+    # for loss of Primary-to-Consolidated synchronization. These are guidance only and are
+    # deliberately not used as automatic health thresholds by this tool.
+    Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Guidance' -Check 'Avaya documented sync marker' -Value 'Completed processing of download stream' -Status 'INFO' -Details 'Avaya Messaging 11.0 SP2 Server Installation Guide, Verifying File Sync (page 203), uses this Mobiclient.log message to confirm that synchronization has finished.'
+
+    if ([string]$HaContext.Role -ne 'Unknown' -and [string]$HaContext.Role -notmatch '^Single Server' -and $HaContext.SyncMarkerCount -eq 0) {
+        Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Guidance' -Check 'Initial HA synchronization' -Value 'Full synchronization not confirmed from Mobiclient.log' -Status 'WARNING' -Details 'For a new HA installation, Avaya warns to complete the full Primary/Consolidated synchronization, and then each Secondary synchronization, before logging in or proceeding with additional Secondary deployment. This warning does not prove the current system is a new installation.'
+    }
+
+    if ([string]$HaContext.Role -ne 'Unknown' -and [string]$HaContext.Role -notmatch '^Single Server' -and $HaContext.OverallStatus -ne 'HEALTHY') {
+        Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Guidance' -Check 'Primary-to-Consolidated sync recovery window' -Value '10 days documented for Avaya Messaging 11.0 SP2' -Status 'WARNING' -Details 'The Avaya Messaging 11.0 SP2 HA introduction states that if synchronization between the Primary voice server and Consolidated server fails, the connection should be restored within 10 days before all servers revert to Demo Mode. Treat this as release-specific operational guidance, not as a reason to delay troubleshooting.'
+    }
+
+    Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Guidance' -Check 'Consolidated server failure impact' -Value 'Voice traffic may continue while UM services are unavailable' -Status 'INFO' -Details 'The Avaya Messaging 11.0 SP2 HA introduction states that if the Consolidated server fails, remaining voice servers can continue voice processing, while UM services such as calendar sync, email integration, and transcription are unavailable.'
+
+    $CredentialFailures = @($HaContext.ServiceEvents | Where-Object { $_.CredentialFailure } | Sort-Object TimeCreated -Descending)
+    if ($HaContext.OverallStatus -eq 'FAILED' -and $CredentialFailures.Count -gt 0) {
+        $Latest = $CredentialFailures[0]
+        Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Summary' -Check 'Likely cause' -Value 'Service-account startup failure' -Status 'ATTENTION' -Details ('SCM {0} at {1:MM/dd/yyyy HH:mm:ss}. Verify the configured Log On credentials for {2} and other IX Messaging services using the same account.' -f $Latest.Id,$Latest.TimeCreated,$Latest.Service)
+    }
+
+    Add-IxmHealthFinding -List $Findings -Section 'HA / MobiLink Summary' -Check 'Voicemail-to-email note' -Value 'MobiLink is upstream of SMTP task processing in HA' -Status 'INFO' -Details 'MobiLink is not the SMTP client. A Voice-to-Consolidated synchronization failure can prevent Consolidated-side SMTP tasks from receiving/processing new voicemail-to-email work.'
+}
+
+function Show-IxmHaLogDetail {
+    param([Parameter(Mandatory)]$HaContext)
+
+    if (-not $HaContext.MobiclientLogFound) { return }
+    if (@($HaContext.RecentSyncLines).Count -eq 0 -and @($HaContext.RecentLogErrors).Count -eq 0) { return }
+
+    Write-Host ''
+    $Answer = (Read-Host 'Show recent MobiLink success/error log entries? [y/N]').Trim()
+    if ($Answer -notmatch '^(?i)y(?:es)?$') { return }
+
+    Write-Host ''
+    Write-Host 'RECENT MOBILINK SUCCESS MARKERS' -ForegroundColor Cyan
+    Write-Host ('-' * 78)
+    if (@($HaContext.RecentSyncLines).Count -eq 0) {
+        Write-Host 'No successful download-stream markers found.' -ForegroundColor Yellow
+    }
+    else {
+        foreach ($Line in @($HaContext.RecentSyncLines)) {
+            Write-Host $Line -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'RECENT MOBILINK ERROR / FAILURE LINES' -ForegroundColor Cyan
+    Write-Host ('-' * 78)
+    if (@($HaContext.RecentLogErrors).Count -eq 0) {
+        Write-Host 'No recent failure-pattern lines found in the inspected log tail.' -ForegroundColor Green
+    }
+    else {
+        foreach ($Line in @($HaContext.RecentLogErrors)) {
+            Write-Host $Line -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Get-IxmHealthServices {
+    param(
+        [Parameter(Mandatory)]$Findings,
+        [Parameter(Mandatory)]$HaContext
+    )
+
+    $Section = 'HA / MobiLink Services'
+    $Services = @($HaContext.ServiceInventory)
+    $Definitions = @(Get-IxmHaServiceDefinitions -Role ([string]$HaContext.Role))
+
+    Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Role used for service checks' -Value ([string]$HaContext.Role) -Status 'INFO' -Details ('Derived from {0}; Primary/Secondary is refined from LocationNodes later when database access is available.' -f $HaContext.RoleSource)
+
+    $Relevant = New-Object System.Collections.Generic.List[object]
+
+    foreach ($Definition in $Definitions) {
+        $Found = @(
+            $Services | Where-Object {
+                [string]$_.DisplayName -match $Definition.Regex -or [string]$_.Name -match $Definition.Regex
+            }
+        )
+
+        if ($Found.Count -eq 0) {
+            if ($Definition.Critical) {
+                $HaContext.RequiredServiceIssues.Add(('{0}: MISSING' -f $Definition.Label))
+                Add-IxmHealthFinding -List $Findings -Section $Section -Check $Definition.Label -Value 'MISSING' -Status 'ATTENTION' -Details 'Required for this detected HA/MobiLink role.'
             }
             else {
-                Add-IxmHealthFinding -List $Findings -Section $Section -Check $Check.Label -Value ('{0} non-running' -f $Stopped.Count) -Status 'ATTENTION' -Details (($Stopped | ForEach-Object { '{0}={1}' -f $_.DisplayName,$_.Status }) -join '; ')
+                Add-IxmHealthFinding -List $Findings -Section $Section -Check $Definition.Label -Value 'Not installed / not detected' -Status 'NOT APPLICABLE' -Details 'Related service; not treated as an HA synchronization failure by itself.'
+            }
+            continue
+        }
+
+        foreach ($Svc in $Found) {
+            if (-not @($Relevant | Where-Object { $_.Name -eq $Svc.Name }).Count) {
+                $Relevant.Add($Svc)
+            }
+
+            $State = [string]$Svc.State
+            $StartMode = [string]$Svc.StartMode
+            $DisplayState = $State.ToUpperInvariant()
+            if ($StartMode -match '(?i)disabled') { $DisplayState = 'DISABLED' }
+
+            $Status = if ($Definition.Critical) { 'OK' } else { 'INFO' }
+            if ($StartMode -match '(?i)disabled') {
+                $Status = if ($Definition.Critical) { 'ATTENTION' } else { 'WARNING' }
+                if ($Definition.Critical) { $HaContext.RequiredServiceIssues.Add(('{0}: DISABLED' -f $Definition.Label)) }
+            }
+            elseif ($State -ne 'Running') {
+                $Status = if ($Definition.Critical) { 'ATTENTION' } else { 'WARNING' }
+                if ($Definition.Critical) { $HaContext.RequiredServiceIssues.Add(('{0}: {1}' -f $Definition.Label,$DisplayState)) }
+            }
+
+            $StartTime = Get-IxmServiceProcessStartTime -Service $Svc
+            $StartText = if ($null -eq $StartTime) { 'n/a' } else { $StartTime.ToString('MM/dd/yyyy HH:mm:ss') }
+            $Path = ([string]$Svc.PathName -replace '[\r\n]+',' ').Trim()
+            $Details = 'DisplayName="{0}"; ServiceName="{1}"; Startup={2}; LogOnAs={3}; PID={4}; ProcessStart={5}; Path={6}' -f $Svc.DisplayName,$Svc.Name,$StartMode,$Svc.StartName,$Svc.ProcessId,$StartText,$Path
+
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check $Definition.Label -Value $DisplayState -Status $Status -Details $Details
+        }
+    }
+
+    # Include all UC / SQL Anywhere / MobiLink / DBWatcher services so account and
+    # event correlation does not miss non-UC-prefixed HA components.
+    foreach ($Svc in @(
+        $Services | Where-Object {
+            [string]$_.DisplayName -match '(?i)^(UC|SQL Anywhere|MobiLink|DBWatcher)' -or
+            [string]$_.Name -match '(?i)^(UC|SQL Anywhere|MobiLink|DBWatcher)'
+        }
+    )) {
+        if (-not @($Relevant | Where-Object { $_.Name -eq $Svc.Name }).Count) {
+            $Relevant.Add($Svc)
+        }
+    }
+    $HaContext.RelevantServices = $Relevant.ToArray()
+
+    # Service-account summary for all Avaya-related services.
+    $AccountSection = 'Services Using IX Messaging Service Accounts'
+    $Accounts = @(
+        $HaContext.RelevantServices |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.StartName) } |
+        Group-Object StartName |
+        Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Name'; Descending = $false }
+    )
+
+    if ($Accounts.Count -eq 0) {
+        Add-IxmHealthFinding -List $Findings -Section $AccountSection -Check 'Account summary' -Value 'No service logon accounts discovered' -Status 'INFO'
+    }
+    else {
+        foreach ($Group in $Accounts) {
+            $Account = [string]$Group.Name
+            Add-IxmHealthFinding -List $Findings -Section $AccountSection -Check $Account -Value ('{0} IX Messaging service(s)' -f $Group.Count) -Status 'INFO' -Details ((@($Group.Group | ForEach-Object { [string]$_.DisplayName }) | Sort-Object -Unique) -join '; ')
+
+            $SameAccount = @($Services | Where-Object { [string]$_.StartName -ieq $Account })
+            $Names = @($SameAccount | ForEach-Object { '{0} [{1}]' -f $_.DisplayName,$_.Name } | Sort-Object)
+            $Preview = @($Names | Select-Object -First 30)
+            $Suffix = if ($Names.Count -gt 30) { ' ... +{0} more' -f ($Names.Count - 30) } else { '' }
+            Add-IxmHealthFinding -List $Findings -Section $AccountSection -Check ('All Windows services using {0}' -f $Account) -Value ('{0} service(s)' -f $SameAccount.Count) -Status 'INFO' -Details (($Preview -join '; ') + $Suffix)
+        }
+    }
+
+    # Account-consistency heuristic within the SQL Anywhere/MobiLink family. This
+    # is intentionally a warning rather than a failure because legitimate service
+    # account layouts can vary by IX Messaging release and deployment.
+    $SqlMobi = @(
+        $HaContext.RelevantServices | Where-Object {
+            [string]$_.DisplayName -match '(?i)^(SQL Anywhere|MobiLink)' -or
+            [string]$_.Name -match '(?i)^(SQL Anywhere|MobiLink)'
+        }
+    )
+    $SqlAccountGroups = @($SqlMobi | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.StartName) } | Group-Object StartName | Sort-Object Count -Descending)
+    if ($SqlAccountGroups.Count -gt 1 -and $SqlAccountGroups[0].Count -ge 2) {
+        $Dominant = [string]$SqlAccountGroups[0].Name
+        foreach ($Group in @($SqlAccountGroups | Select-Object -Skip 1)) {
+            foreach ($Svc in $Group.Group) {
+                $Warning = '{0} uses {1}; most discovered SQL Anywhere/MobiLink services use {2}' -f $Svc.DisplayName,$Svc.StartName,$Dominant
+                $HaContext.AccountWarnings.Add($Warning)
+                Add-IxmHealthFinding -List $Findings -Section $AccountSection -Check 'UNEXPECTED LOGON ACCOUNT (heuristic)' -Value ([string]$Svc.DisplayName) -Status 'WARNING' -Details $Warning
+            }
+        }
+    }
+
+    try {
+        $StartPending = @($Services | Where-Object { [string]$_.State -eq 'Start Pending' -or [string]$_.State -eq 'StartPending' })
+        if ($StartPending.Count -eq 0) {
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'Services stuck StartPending' -Value '0' -Status 'OK'
+        }
+        else {
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'Services stuck StartPending' -Value ($StartPending.Count.ToString()) -Status 'ATTENTION' -Details (($StartPending | Select-Object -ExpandProperty DisplayName) -join '; ')
+        }
+    }
+    catch {
+        Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'Services stuck StartPending' -Value 'Check failed' -Status 'INFO'
+    }
+
+    # Preserve the original Avaya health-check intent: DBWatcher and UCArchiver
+    # are explicitly reviewed as core services expected to be running on IXM servers.
+    foreach ($CoreService in @(
+        [pscustomobject]@{ Label='DBWatcher'; Regex='(?i)^DBWatcher$' },
+        [pscustomobject]@{ Label='UCArchiver'; Regex='(?i)^UC\s*Archiver$|^UCArchiver$' }
+    )) {
+        try {
+            $Core = @(
+                $Services | Where-Object {
+                    [string]$_.DisplayName -match $CoreService.Regex -or
+                    [string]$_.Name -match $CoreService.Regex
+                }
+            )
+
+            if ($Core.Count -eq 0) {
+                Add-IxmHealthFinding -List $Findings -Section 'Services' -Check $CoreService.Label -Value 'Not detected' -Status 'WARNING' -Details 'The original Avaya health check identifies this as a service that should be running on all messaging servers.'
+            }
+            else {
+                foreach ($Svc in $Core) {
+                    $State = [string]$Svc.State
+                    $Status = if ($State -eq 'Running') { 'OK' } else { 'ATTENTION' }
+                    $Details = 'DisplayName="{0}"; ServiceName="{1}"; Startup={2}; LogOnAs={3}' -f $Svc.DisplayName,$Svc.Name,$Svc.StartMode,$Svc.StartName
+                    Add-IxmHealthFinding -List $Findings -Section 'Services' -Check $CoreService.Label -Value $State -Status $Status -Details $Details
+                }
             }
         }
         catch {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check $Check.Label -Value 'Check failed' -Status 'WARNING' -Details $_.Exception.Message
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check $CoreService.Label -Value 'Check failed' -Status 'WARNING' -Details $_.Exception.Message
         }
     }
 
+    # The source health check displayed every SQL Anywhere service. Keep a compact
+    # equivalent so a technician can see unexpected stopped SQL components even
+    # when they are not part of the role-specific HA requirements above.
     try {
-        $StartPending = @(
-            Get-Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.Status -eq 'StartPending' }
+        $SqlAnywhereServices = @(
+            $Services | Where-Object {
+                [string]$_.DisplayName -like 'SQL Anywhere*' -or
+                [string]$_.Name -like 'SQL Anywhere*'
+            }
         )
 
-        if ($StartPending.Count -eq 0) {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Services stuck StartPending' -Value '0' -Status 'OK'
+        if ($SqlAnywhereServices.Count -eq 0) {
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'SQL Anywhere services' -Value 'None detected' -Status 'WARNING'
         }
         else {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Services stuck StartPending' -Value ($StartPending.Count.ToString()) -Status 'ATTENTION' -Details (($StartPending | Select-Object -ExpandProperty DisplayName) -join '; ')
+            $SqlNonRunning = @($SqlAnywhereServices | Where-Object { [string]$_.State -ne 'Running' })
+            $SqlDetails = @(
+                $SqlAnywhereServices | ForEach-Object {
+                    '{0}={1}' -f $_.DisplayName,$_.State
+                }
+            ) -join '; '
+            $SqlStatus = if ($SqlNonRunning.Count -gt 0) { 'WARNING' } else { 'OK' }
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'SQL Anywhere services' -Value ('{0} running / {1} non-running / {2} total' -f ($SqlAnywhereServices.Count - $SqlNonRunning.Count),$SqlNonRunning.Count,$SqlAnywhereServices.Count) -Status $SqlStatus -Details $SqlDetails
         }
     }
     catch {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Services stuck StartPending' -Value 'Check failed' -Status 'INFO'
+        Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'SQL Anywhere services' -Value 'Check failed' -Status 'INFO' -Details $_.Exception.Message
     }
 
-    try {
-        $VoiceService = Get-Service -Name 'UCVoiceServer' -ErrorAction SilentlyContinue
-        if ($null -ne $VoiceService) {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Local IXM role' -Value 'Voice Server' -Status 'INFO' -Details ('UCVoiceServer service state: {0}' -f $VoiceService.Status)
-        }
-        else {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Local IXM role' -Value 'Not identified as Voice Server' -Status 'INFO' -Details 'UCVoiceServer service is not installed on this Windows host.'
-        }
-    }
-    catch {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Local IXM role' -Value 'Unable to determine' -Status 'INFO'
-    }
-
+    # Restore the original running/stopped UC-service review, but summarize it so
+    # Option 14 remains readable. Non-running UC services are warnings because some
+    # services are legitimately role-dependent and must be interpreted by topology.
     try {
         $UcServices = @(
-            Get-Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -like 'UC *' }
-        )
-
-        if ($UcServices.Count -gt 0) {
-            $Running = @($UcServices | Where-Object { $_.Status -eq 'Running' })
-            $Stopped = @($UcServices | Where-Object { $_.Status -eq 'Stopped' })
-
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'UC services' -Value ('{0} running / {1} stopped / {2} total' -f $Running.Count,$Stopped.Count,$UcServices.Count) -Status 'INFO' -Details 'Stopped UC services can be role-dependent; review rather than assuming every stopped service is a fault.'
-
-            if ($Stopped.Count -gt 0) {
-                Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Stopped UC service list' -Value ($Stopped.Count.ToString()) -Status 'INFO' -Details (($Stopped | Select-Object -ExpandProperty DisplayName) -join '; ')
+            $Services | Where-Object {
+                [string]$_.DisplayName -match '(?i)^UC(?:\s|$)' -or
+                [string]$_.Name -match '(?i)^UC'
             }
+        )
+        $UcRunning = @($UcServices | Where-Object { [string]$_.State -eq 'Running' })
+        $UcNonRunning = @($UcServices | Where-Object { [string]$_.State -ne 'Running' })
+
+        if ($UcServices.Count -eq 0) {
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'UC services running' -Value 'No UC services detected' -Status 'WARNING'
         }
         else {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'UC services' -Value 'No "UC *" display names found' -Status 'INFO'
+            $RunningNames = @($UcRunning | ForEach-Object { [string]$_.DisplayName } | Sort-Object -Unique)
+            $NonRunningNames = @($UcNonRunning | ForEach-Object { '{0}={1}' -f $_.DisplayName,$_.State } | Sort-Object -Unique)
+
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'UC services running' -Value ('{0} of {1}' -f $UcRunning.Count,$UcServices.Count) -Status 'INFO' -Details ($RunningNames -join '; ')
+
+            if ($UcNonRunning.Count -eq 0) {
+                Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'UC services non-running' -Value '0' -Status 'OK'
+            }
+            else {
+                Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'UC services non-running' -Value ($UcNonRunning.Count.ToString()) -Status 'WARNING' -Details (('Review against the local server role; stopped UC services can be intentional. ' + ($NonRunningNames -join '; ')))
+            }
         }
     }
     catch {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'UC services' -Value 'Check failed' -Status 'WARNING' -Details $_.Exception.Message
+        Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'UC service overview' -Value 'Check failed' -Status 'INFO' -Details $_.Exception.Message
     }
 
     foreach ($Optional in @(
@@ -4673,43 +5407,42 @@ function Get-IxmHealthServices {
         [pscustomobject]@{Label='RealSpeak services'; Pattern='RealSpeak*'}
     )) {
         try {
-            $Services = @(
-                Get-Service -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName -like $Optional.Pattern -or $_.Name -like $Optional.Pattern }
+            $OptionalServices = @(
+                $Services | Where-Object { [string]$_.DisplayName -like $Optional.Pattern -or [string]$_.Name -like $Optional.Pattern }
             )
 
-            if ($Services.Count -eq 0) {
-                Add-IxmHealthFinding -List $Findings -Section $Section -Check $Optional.Label -Value 'Not installed' -Status 'NOT APPLICABLE'
+            if ($OptionalServices.Count -eq 0) {
+                Add-IxmHealthFinding -List $Findings -Section 'Services' -Check $Optional.Label -Value 'Not installed' -Status 'NOT APPLICABLE'
             }
             else {
-                $Stopped = @($Services | Where-Object { $_.Status -ne 'Running' })
+                $Stopped = @($OptionalServices | Where-Object { [string]$_.State -ne 'Running' })
                 if ($Stopped.Count -gt 0) {
-                    Add-IxmHealthFinding -List $Findings -Section $Section -Check $Optional.Label -Value ('{0} installed / {1} non-running' -f $Services.Count,$Stopped.Count) -Status 'WARNING' -Details (($Stopped | ForEach-Object { '{0}={1}' -f $_.DisplayName,$_.Status }) -join '; ')
+                    Add-IxmHealthFinding -List $Findings -Section 'Services' -Check $Optional.Label -Value ('{0} installed / {1} non-running' -f $OptionalServices.Count,$Stopped.Count) -Status 'WARNING' -Details (($Stopped | ForEach-Object { '{0}={1}' -f $_.DisplayName,$_.State }) -join '; ')
                 }
                 else {
-                    Add-IxmHealthFinding -List $Findings -Section $Section -Check $Optional.Label -Value ('{0} running' -f $Services.Count) -Status 'OK'
+                    Add-IxmHealthFinding -List $Findings -Section 'Services' -Check $Optional.Label -Value ('{0} running' -f $OptionalServices.Count) -Status 'OK'
                 }
             }
         }
         catch {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check $Optional.Label -Value 'Check failed' -Status 'INFO'
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check $Optional.Label -Value 'Check failed' -Status 'INFO'
         }
     }
 
     try {
-        $W3 = Get-Service -Name W3SVC -ErrorAction SilentlyContinue
+        $W3 = $Services | Where-Object { [string]$_.Name -eq 'W3SVC' } | Select-Object -First 1
         if ($null -eq $W3) {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS World Wide Web service' -Value 'Not installed' -Status 'NOT APPLICABLE'
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS World Wide Web service' -Value 'Not installed' -Status 'NOT APPLICABLE'
         }
-        elseif ($W3.Status -eq 'Running') {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS World Wide Web service' -Value 'Running' -Status 'OK'
+        elseif ([string]$W3.State -eq 'Running') {
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS World Wide Web service' -Value 'Running' -Status 'OK'
         }
         else {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS World Wide Web service' -Value ([string]$W3.Status) -Status 'ATTENTION'
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS World Wide Web service' -Value ([string]$W3.State) -Status 'ATTENTION'
         }
     }
     catch {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS World Wide Web service' -Value 'Check failed' -Status 'INFO'
+        Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS World Wide Web service' -Value 'Check failed' -Status 'INFO'
     }
 
     try {
@@ -4718,32 +5451,29 @@ function Get-IxmHealthServices {
             $Pools = @(Get-ChildItem IIS:\AppPools -ErrorAction Stop)
 
             if ($Pools.Count -eq 0) {
-                Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS application pools' -Value 'No application pools found' -Status 'INFO'
+                Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS application pools' -Value 'No application pools found' -Status 'INFO'
             }
             else {
                 $NonRunning = New-Object System.Collections.Generic.List[string]
-
                 foreach ($Pool in $Pools) {
                     $State = (Get-WebAppPoolState -Name $Pool.Name -ErrorAction Stop).Value
-                    if ($State -ne 'Started') {
-                        $NonRunning.Add(('{0}={1}' -f $Pool.Name,$State))
-                    }
+                    if ($State -ne 'Started') { $NonRunning.Add(('{0}={1}' -f $Pool.Name,$State)) }
                 }
 
                 if ($NonRunning.Count -eq 0) {
-                    Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS application pools' -Value ('{0} started / 0 stopped' -f $Pools.Count) -Status 'OK'
+                    Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS application pools' -Value ('{0} started / 0 stopped' -f $Pools.Count) -Status 'OK'
                 }
                 else {
-                    Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS application pools' -Value ('{0} non-started of {1}' -f $NonRunning.Count,$Pools.Count) -Status 'WARNING' -Details ($NonRunning -join '; ')
+                    Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS application pools' -Value ('{0} non-started of {1}' -f $NonRunning.Count,$Pools.Count) -Status 'WARNING' -Details ($NonRunning -join '; ')
                 }
             }
         }
         else {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS application pools' -Value 'WebAdministration module not installed' -Status 'NOT APPLICABLE'
+            Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS application pools' -Value 'WebAdministration module not installed' -Status 'NOT APPLICABLE'
         }
     }
     catch {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'IIS application pools' -Value 'Check failed' -Status 'WARNING' -Details $_.Exception.Message
+        Add-IxmHealthFinding -List $Findings -Section 'Services' -Check 'IIS application pools' -Value 'Check failed' -Status 'WARNING' -Details $_.Exception.Message
     }
 }
 
@@ -4773,7 +5503,8 @@ function Invoke-IxmHealthSql {
 function Get-IxmHealthDatabase {
     param(
         [Parameter(Mandatory)]$Findings,
-        [Parameter(Mandatory)]$Connection
+        [Parameter(Mandatory)]$Connection,
+        [AllowNull()]$HaContext
     )
 
     $Section = 'Database'
@@ -4821,6 +5552,14 @@ ORDER BY ServerType, ServerName
             if ($RoleRows.Count -gt 0) {
                 Add-IxmHealthFinding -List $Findings -Section $Section -Check $RoleMap[$RoleType] -Value (($RoleRows | ForEach-Object { [string]$_.ServerName }) -join ', ') -Status 'INFO'
             }
+        }
+
+        $PrimaryConsolidatedRows = @($Rows | Where-Object { -not $_.IsNull('ServerType') -and [int]$_.ServerType -eq 4 })
+        if ($PrimaryConsolidatedRows.Count -eq 0) {
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Topology mode' -Value 'No Primary Consolidated node detected' -Status 'INFO' -Details 'The original Avaya health check treated the absence of ServerType 4 as a single-server topology.'
+        }
+        else {
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Topology mode' -Value 'HA / Consolidated topology detected' -Status 'INFO' -Details ('Primary Consolidated: {0}' -f (($PrimaryConsolidatedRows | ForEach-Object { [string]$_.ServerName }) -join ', '))
         }
     }
     else {
@@ -4911,30 +5650,41 @@ WHERE SUBJECT LIKE '%FW: Message with subject ''FW: Message with subject%'
         Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Nested FW subject loops' -Value 'Skipped by production performance guard' -Status 'INFO' -Details ('MESSAGES table exceeded the {0:N0}-row automatic scan threshold.' -f $script:HealthMessageLoopScanThreshold)
     }
 
-    # Active MobiLink subscriptions.
-    $SubResult = Invoke-IxmHealthSql -Connection $Connection -Sql @"
+    # Active MobiLink subscriptions. The original health check scoped this view
+    # to the Primary Consolidated server. Preserve that intent while retaining the
+    # newer role detection and structured findings.
+    $LocalRole = if ($null -ne $HaContext) { [string]$HaContext.Role } else { 'Unknown' }
+    $RunActiveSubscriptions = ($LocalRole -eq 'Primary Consolidated Server')
+
+    if ($RunActiveSubscriptions) {
+        $SubResult = Invoke-IxmHealthSql -Connection $Connection -Sql @"
 SELECT name, last_upload_time, last_download_time
 FROM DBA.vw_ml_ActiveSubscriptions
 ORDER BY name
 "@
 
-    if ($SubResult.Success) {
-        $Rows = @($SubResult.Rows)
-        if ($Rows.Count -gt 0) {
-            $Detail = @(
-                $Rows | ForEach-Object {
-                    '{0}: upload={1}, download={2}' -f ([string]$_.name),([string]$_.last_upload_time),([string]$_.last_download_time)
-                }
-            ) -join '; '
+        if ($SubResult.Success) {
+            $Rows = @($SubResult.Rows)
+            if ($Rows.Count -gt 0) {
+                $Detail = @(
+                    $Rows | ForEach-Object {
+                        '{0}: upload={1}, download={2}' -f ([string]$_.name),([string]$_.last_upload_time),([string]$_.last_download_time)
+                    }
+                ) -join '; '
 
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Active subscriptions' -Value ('{0} subscription(s)' -f $Rows.Count) -Status 'INFO' -Details $Detail
+                $TopologyNote = 'Original Avaya guidance: ml_remote_consol_0, CSE, Web, and Report-server entries can legitimately show 1900-01-01 00:00:00.0 for last_upload_time. Do not treat that timestamp alone as a synchronization failure.'
+                Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Active subscriptions' -Value ('{0} subscription(s)' -f $Rows.Count) -Status 'INFO' -Details ($TopologyNote + ' ' + $Detail)
+            }
+            else {
+                Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Active subscriptions' -Value 'No active-subscription rows' -Status 'INFO' -Details 'Local role is Primary Consolidated Server.'
+            }
         }
         else {
-            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Active subscriptions' -Value 'No active-subscription rows' -Status 'INFO'
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Active subscriptions' -Value 'Unavailable' -Status 'INFO' -Details $SubResult.Error
         }
     }
     else {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Active subscriptions' -Value 'Unavailable / not applicable' -Status 'INFO' -Details $SubResult.Error
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Active subscriptions' -Value ('Not run on local role: {0}' -f $LocalRole) -Status 'NOT APPLICABLE' -Details 'The original Avaya health check displays DBA.vw_ml_ActiveSubscriptions on the Primary Consolidated server.'
     }
 
     # WebLM license expiration.
@@ -4993,7 +5743,8 @@ function Get-IxmHealthTodayActivity {
         try {
             foreach ($Log in $StatusLogs) {
                 foreach ($Match in @(
-                    Select-String -LiteralPath $Log.Path -SimpleMatch -Pattern $PatternItem.Pattern -AllMatches -ErrorAction SilentlyContinue                )) {
+                    Select-String -LiteralPath $Log.Path -SimpleMatch -Pattern $PatternItem.Pattern -AllMatches -ErrorAction SilentlyContinue
+                )) {
                     $Count += @($Match.Matches).Count
                 }
             }
@@ -5021,8 +5772,14 @@ function Get-IxmHealthTodayActivity {
             }
         }
 
-        $Last = @($DtmfLines | Select-Object -Last 5)
-        $Detail = if ($Last.Count -gt 0) { $Last -join ' || ' } else { 'No DTMF buffer entries found today.' }
+        $Last = @($DtmfLines | Select-Object -Last 20)
+        if ($Last.Count -gt 0) {
+            $EntryLabel = if ($Last.Count -eq 1) { 'entry' } else { 'entries' }
+            $Detail = 'Last {0} {1}: {2}' -f $Last.Count,$EntryLabel,($Last -join ' || ')
+        }
+        else {
+            $Detail = 'No DTMF buffer entries found today.'
+        }
 
         Add-IxmHealthFinding -List $Findings -Section $Section -Check 'DTMF buffer entries' -Value ($DtmfLines.Count.ToString()) -Status 'INFO' -Details $Detail
     }
@@ -5034,33 +5791,163 @@ function Get-IxmHealthTodayActivity {
 function Get-IxmHealthDatabaseSyncLog {
     param(
         [Parameter(Mandatory)]$Findings,
-        [AllowNull()][string]$UcRoot
+        [AllowNull()][string]$UcRoot,
+        [Parameter(Mandatory)]$HaContext
     )
 
-    $Section = 'Database Sync'
+    $Section = 'HA / MobiLink Log'
 
-    if ([string]::IsNullOrWhiteSpace([string]$UcRoot)) {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Mobiclient.log' -Value 'UC root unavailable' -Status 'NOT APPLICABLE'
+    if ([string]$HaContext.Role -match '^Single Server') {
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Mobiclient.log' -Value 'Not required for single-server topology' -Status 'NOT APPLICABLE' -Details 'No Primary Consolidated node was detected, so HA MobiLink synchronization health is not evaluated.'
         return
     }
 
-    $SyncLog = Join-Path $UcRoot 'logs\db\Mobiclient.log'
-
-    if (-not (Test-Path -LiteralPath $SyncLog)) {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Mobiclient.log' -Value 'Not present' -Status 'NOT APPLICABLE' -Details $SyncLog
+    if ([string]::IsNullOrWhiteSpace([string]$UcRoot)) {
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Mobiclient.log' -Value 'UC root unavailable' -Status 'WARNING' -Details 'Sync status cannot be verified from the documented log.'
         return
+    }
+
+    $ExpectedDirs = @(
+        (Join-Path $UcRoot 'DB\Logs'),
+        (Join-Path $UcRoot 'Logs\DB')
+    ) | Select-Object -Unique
+
+    foreach ($Dir in $ExpectedDirs) {
+        if (Test-Path -LiteralPath $Dir) {
+            $Files = @(Get-ChildItem -LiteralPath $Dir -File -Filter '*.log' -ErrorAction SilentlyContinue)
+            if ($Files.Count -eq 0) {
+                Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Expected log directory' -Value 'WARNING: directory exists but contains no log files' -Status 'WARNING' -Details $Dir
+            }
+            else {
+                Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Expected log directory' -Value ('{0} log file(s)' -f $Files.Count) -Status 'INFO' -Details $Dir
+            }
+        }
+    }
+
+    $Candidates = New-Object System.Collections.Generic.List[object]
+    foreach ($Path in @(
+        (Join-Path $UcRoot 'DB\Logs\Mobiclient.log'),
+        (Join-Path $UcRoot 'Logs\DB\Mobiclient.log')
+    )) {
+        if (Test-Path -LiteralPath $Path) {
+            try { $Candidates.Add((Get-Item -LiteralPath $Path -ErrorAction Stop)) } catch { }
+        }
+    }
+
+    if ($Candidates.Count -eq 0) {
+        try {
+            foreach ($Item in @(Get-ChildItem -LiteralPath $UcRoot -File -Recurse -Filter 'Mobiclient.log' -ErrorAction SilentlyContinue)) {
+                if (-not @($Candidates | Where-Object { $_.FullName -ieq $Item.FullName }).Count) {
+                    $Candidates.Add($Item)
+                }
+            }
+        }
+        catch {
+            Write-Verbose ('Recursive Mobiclient.log discovery failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    # Also surface related MobiLink/SQL Anywhere logs without dumping their contents.
+    try {
+        $Related = @(
+            Get-ChildItem -LiteralPath $UcRoot -File -Recurse -Filter '*.log' -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '(?i)mobi|mobilink|sql.*anywhere|dbml|mlclient' -or
+                $_.DirectoryName -match '(?i)\\DB\\Logs$|\\Logs\\DB$'
+            } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 20
+        )
+        if ($Related.Count -gt 0) {
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Related MobiLink / SQL logs' -Value ('{0} discovered (showing up to 20)' -f $Related.Count) -Status 'INFO' -Details (($Related | ForEach-Object { '{0} [{1:MM/dd/yyyy HH:mm:ss}]' -f $_.FullName,$_.LastWriteTime }) -join '; ')
+        }
+    }
+    catch {
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Related MobiLink / SQL logs' -Value 'Discovery incomplete' -Status 'INFO' -Details $_.Exception.Message
+    }
+
+    if ($Candidates.Count -eq 0) {
+        $HaContext.MobiclientLogFound = $false
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Mobiclient.log' -Value 'NOT FOUND' -Status 'WARNING' -Details 'Sync status cannot be verified from the documented log. Services and Windows events are still evaluated.'
+        return
+    }
+
+    $Item = @($Candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1)[0]
+    $SyncLog = $Item.FullName
+    $HaContext.MobiclientLogFound = $true
+    $HaContext.MobiclientLogPath = $SyncLog
+    $HaContext.MobiclientFileLastWrite = $Item.LastWriteTime
+
+    Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Mobiclient.log' -Value $SyncLog -Status 'INFO' -Details ('Size={0:N2} MB; LastWriteTime={1:MM/dd/yyyy HH:mm:ss}' -f ($Item.Length / 1MB),$Item.LastWriteTime)
+
+    try {
+        $Matches = @(
+            Select-String -LiteralPath $SyncLog -SimpleMatch -Pattern 'Completed processing of download stream' -ErrorAction SilentlyContinue
+        )
+        $HaContext.SyncMarkerCount = $Matches.Count
+        $Recent = @($Matches | Select-Object -Last 10)
+        $HaContext.RecentSyncLines = @($Recent | ForEach-Object { ([string]$_.Line).Trim() })
+
+        $LastSuccess = $null
+        for ($i = $Recent.Count - 1; $i -ge 0; $i--) {
+            $CandidateTime = Get-IxmTimestampFromLogLine -Line ([string]$Recent[$i].Line)
+            if ($null -ne $CandidateTime) {
+                $LastSuccess = $CandidateTime
+                break
+            }
+        }
+        $HaContext.LastSyncSuccess = $LastSuccess
+
+        if ($Matches.Count -eq 0) {
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Successful sync markers' -Value '0' -Status 'WARNING' -Details 'No "Completed processing of download stream" marker was found.'
+        }
+        elseif ($null -eq $LastSuccess) {
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Successful sync markers' -Value ('{0} found' -f $Matches.Count) -Status 'WARNING' -Details 'Markers are present, but a timestamp could not be parsed from the most recent entries; recency cannot be proven.'
+        }
+        else {
+            $Age = (Get-Date) - $LastSuccess
+            $HaContext.SyncAge = $Age
+            # Diagnostic threshold only; it is intentionally not presented as Avaya policy.
+            $HaContext.SyncIsRecent = ($Age.TotalMinutes -le 30 -and $Age.TotalMinutes -ge -5)
+            $AgeText = '{0}d {1}h {2}m {3}s' -f [math]::Floor($Age.TotalDays),$Age.Hours,$Age.Minutes,$Age.Seconds
+            $Status = if ($HaContext.SyncIsRecent) { 'OK' } else { 'WARNING' }
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Last successful sync' -Value ($LastSuccess.ToString('MM/dd/yyyy HH:mm:ss')) -Status $Status -Details ('Sync age: {0}; marker: Completed processing of download stream; freshness threshold used by this tool: 30 minutes.' -f $AgeText)
+        }
+    }
+    catch {
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Successful sync markers' -Value 'Check failed' -Status 'WARNING' -Details $_.Exception.Message
     }
 
     try {
-        $Item = Get-Item -LiteralPath $SyncLog -ErrorAction Stop
-        $Count = @(
-            Select-String -LiteralPath $SyncLog -SimpleMatch -Pattern 'completed processing of download stream' -ErrorAction SilentlyContinue
-        ).Count
+        $Tail = @(Get-Content -LiteralPath $SyncLog -Tail 5000 -ErrorAction Stop)
+        $ErrorLines = @(
+            $Tail | Where-Object {
+                $_ -match '(?i)\b(error|failed|failure|exception|unable|authentication|disconnect(?:ed)?|timeout|timed out)\b' -or
+                $_ -match '(?i)connection\s+(?:failed|lost|refused|error|closed|terminated)'
+            } | Select-Object -Last 10
+        )
+        $HaContext.RecentLogErrors = @($ErrorLines | ForEach-Object { ([string]$_).Trim() })
 
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Mobiclient.log' -Value ('{0} completed download-stream marker(s)' -f $Count) -Status 'INFO' -Details ('Last write: {0}; file: {1}. Interpret activity in the context of the server topology.' -f $Item.LastWriteTime,$SyncLog)
+        $LastLogFailure = $null
+        for ($i = $ErrorLines.Count - 1; $i -ge 0; $i--) {
+            $CandidateTime = Get-IxmTimestampFromLogLine -Line ([string]$ErrorLines[$i])
+            if ($null -ne $CandidateTime) {
+                $LastLogFailure = $CandidateTime
+                break
+            }
+        }
+        $HaContext.LastLogFailure = $LastLogFailure
+
+        if ($ErrorLines.Count -eq 0) {
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Recent failure-pattern lines' -Value '0 in last 5000 lines' -Status 'OK'
+        }
+        else {
+            $TimeDetail = if ($null -eq $LastLogFailure) { 'Timestamp of newest failure-pattern line could not be parsed.' } else { 'Newest parsed failure-pattern timestamp: {0:MM/dd/yyyy HH:mm:ss}.' -f $LastLogFailure }
+            Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Recent failure-pattern lines' -Value ($ErrorLines.Count.ToString()) -Status 'WARNING' -Details ($TimeDetail + ' Use the detail prompt to review the recent lines; normal connection messages are not treated as failures unless they contain failure language.')
+        }
     }
     catch {
-        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Mobiclient.log' -Value 'Check failed' -Status 'INFO' -Details $_.Exception.Message
+        Add-IxmHealthFinding -List $Findings -Section $Section -Check 'Recent failure-pattern lines' -Value 'Check failed' -Status 'INFO' -Details $_.Exception.Message
     }
 }
 
@@ -5196,22 +6083,21 @@ function Get-IxmHealthTcp {
 }
 
 function Invoke-IxmSystemHealthCheck {
-    Write-Section 'IX Messaging System Health Check'
+    Write-Section 'IX Messaging System Health Check + HA / MobiLink'
 
     Write-Host 'This health check performs local read operations; database statements are restricted to SELECT by the tool.' -ForegroundColor Green
-    Write-Host 'It does not restart services, modify IIS, change the IX Messaging database, or alter mailbox configuration.' -ForegroundColor Green
+    Write-Host 'It does not restart services, modify service accounts/passwords, change startup types, modify IIS, change the IX Messaging database, or alter mailbox configuration.' -ForegroundColor Green
     Write-Host ''
 
     $Findings = New-Object System.Collections.Generic.List[object]
     $UcRoot = Resolve-IxmUcRoot
+    $ServiceInventory = @(Get-IxmServiceInventory)
+    $HaContext = New-IxmHaContext -ServiceInventory $ServiceInventory
 
     Write-Host 'Checking Windows, resources, and IX Messaging installation...' -ForegroundColor DarkGray
     Get-IxmHealthRegistryAndSystem -Findings $Findings -UcRoot $UcRoot
 
-    Write-Host 'Checking services and IIS...' -ForegroundColor DarkGray
-    Get-IxmHealthServices -Findings $Findings
-
-    Write-Host 'Checking IX Messaging database...' -ForegroundColor DarkGray
+    Write-Host 'Checking IX Messaging database and refining local topology...' -ForegroundColor DarkGray
 
     $Connection = $null
     try {
@@ -5220,19 +6106,28 @@ function Invoke-IxmSystemHealthCheck {
             Write-Host ('Using DSN: {0}' -f $Selected.Name) -ForegroundColor Cyan
 
             $Connection = Open-IxmDsnConnection -Name $Selected.Name
-            Get-IxmHealthDatabase -Findings $Findings -Connection $Connection
+            Update-IxmHaRoleFromDatabase -Findings $Findings -Connection $Connection -HaContext $HaContext
+            Get-IxmHealthDatabase -Findings $Findings -Connection $Connection -HaContext $HaContext
         }
         catch {
             Add-IxmHealthFinding -List $Findings -Section 'Database' -Check 'Database health checks' -Value 'Unavailable' -Status 'WARNING' -Details $_.Exception.Message
         }
 
+        Write-Host 'Checking role-aware services, core services, and service accounts...' -ForegroundColor DarkGray
+        Get-IxmHealthServices -Findings $Findings -HaContext $HaContext
+
         Write-Host 'Checking current-day VServer activity...' -ForegroundColor DarkGray
         Get-IxmHealthTodayActivity -Findings $Findings
 
-        Write-Host 'Checking MobiLink/Mobiclient database synchronization log...' -ForegroundColor DarkGray
-        Get-IxmHealthDatabaseSyncLog -Findings $Findings -UcRoot $UcRoot
+        Write-Host 'Checking Service Control Manager for IXM/MobiLink startup and credential failures...' -ForegroundColor DarkGray
+        Get-IxmHaServiceEvents -Findings $Findings -HaContext $HaContext
 
-        Write-Host 'Checking Windows event log, fax exceptions, Mutare IIS activity, and TCP state...' -ForegroundColor DarkGray
+        Write-Host 'Discovering and checking MobiLink/Mobiclient synchronization logs...' -ForegroundColor DarkGray
+        Get-IxmHealthDatabaseSyncLog -Findings $Findings -UcRoot $UcRoot -HaContext $HaContext
+
+        Add-IxmHaOverallFinding -Findings $Findings -HaContext $HaContext
+
+        Write-Host 'Checking VPIM event history, fax exceptions, Mutare IIS activity, and TCP state...' -ForegroundColor DarkGray
         Get-IxmHealthVpimEvents -Findings $Findings
         Get-IxmHealthTiffConverter -Findings $Findings -UcRoot $UcRoot
         Get-IxmHealthMutare -Findings $Findings
@@ -5243,13 +6138,22 @@ function Invoke-IxmSystemHealthCheck {
 
         Write-Host ''
         Write-Host 'Notes:' -ForegroundColor Yellow
-        Write-Host '  - Stopped UC services can be role-dependent; the report lists them for review rather than assuming every stopped service is a fault.' -ForegroundColor Yellow
+        Write-Host '  - HA status is not declared HEALTHY merely because a MobiLink service is running; the tool also requires a recent successful sync marker from Mobiclient.log.' -ForegroundColor Yellow
+        Write-Host '  - The 30-minute synchronization freshness threshold is a diagnostic threshold used by this tool, not an Avaya support-policy threshold.' -ForegroundColor Yellow
+        Write-Host '  - Avaya Messaging 11.0 SP2 page 203 identifies DB\Logs\Mobiclient.log and "Completed processing of download stream" as the file-sync completion check.' -ForegroundColor Yellow
+        Write-Host '  - The Avaya Messaging 11.0 SP2 HA chapter documents a 10-day recovery window for Primary-to-Consolidated sync loss; this is release-specific guidance, not a troubleshooting delay threshold.' -ForegroundColor Yellow
+        Write-Host '  - On a new HA deployment, Avaya warns not to log into Primary/Secondary servers until the initial full synchronization is complete.' -ForegroundColor Yellow
+        Write-Host '  - MobiLink synchronization is upstream of Consolidated-side SMTP task processing in HA; MobiLink itself is not the SMTP client.' -ForegroundColor Yellow
+        Write-Host '  - Account-consistency warnings are heuristic because legitimate service-account layouts can vary by release and deployment.' -ForegroundColor Yellow
+        Write-Host '  - Stopped related UC services can be role-dependent; the broad UC-service list is for technician review, while only role-required HA services drive the HA result.' -ForegroundColor Yellow
+        Write-Host '  - DBWatcher and UCArchiver are also shown explicitly to preserve the original Avaya health-check review.' -ForegroundColor Yellow
         Write-Host '  - "TUI you have" is counted as prompt occurrences, not unique subscriber logins.' -ForegroundColor Yellow
-        Write-Host '  - ActiveSubscriptions timestamps are displayed for review because normal behavior depends on the IX Messaging topology.' -ForegroundColor Yellow
+        Write-Host '  - ActiveSubscriptions is shown on the Primary Consolidated server, matching the original health-check intent; certain 1900-01-01 upload timestamps can be normal for topology-specific entries.' -ForegroundColor Yellow
         Write-Host '  - CPU, memory, disk, license-expiration, and loop-count thresholds are diagnostic thresholds used by this tool, not Avaya support policy.' -ForegroundColor Yellow
-        Write-Host '  - Run under the least-privileged Windows account that can read the required IXM logs, IIS/service state, and database DSN; Administrator is not inherently required by the tool.' -ForegroundColor Yellow
+        Write-Host '  - Run under the least-privileged Windows account that can read the required IXM logs, IIS/service state, Windows System event log, and database DSN.' -ForegroundColor Yellow
         Write-Host '  - Enterprise PowerShell transcription can capture console output containing customer information.' -ForegroundColor Yellow
 
+        Show-IxmHaLogDetail -HaContext $HaContext
         Export-ResultSet -Data $Rows -BaseName 'ixm_system_health'
     }
     finally {
@@ -5563,7 +6467,7 @@ do {
     Write-Host ' 11. Export mailboxes / email addresses'
     Write-Host ' 12. Current mailbox status / health'
     Write-Host ' 13. Graph / Exchange mailbox failure audit'
-    Write-Host ' 14. IX Messaging system health check'
+    Write-Host ' 14. IX Messaging system health check + HA / MobiLink'
     Write-Host '  0. Exit'
     Write-Host ''
 
