@@ -129,7 +129,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # -----------------------------------------------------------------------------
 
-$ToolVersion = '2.5.3'
+$ToolVersion = '2.5.6'
 $LogRoot = 'X:\UC\logs\VServer'
 
 # CSV fallback is intentionally user-scoped rather than a shared C:\Temp path.
@@ -6443,6 +6443,185 @@ if (-not (Test-Path -LiteralPath $LogRoot)) {
     Write-Host 'VServer log options may return no data, but database-backed options 11 and 12 remain available; options 13 and 14 can use other IX Messaging data separately.' -ForegroundColor Yellow
 }
 
+
+# Option 15 - STATUS based inbound call analysis
+function Invoke-IxmInboundCallAnalysis {
+    $Range = Read-DateRange -CoverageMode STATUS
+    $CallerFilter = (Read-Host 'Caller ID filter (Enter for all)').Trim()
+    $MailboxFilter = (Read-Host 'Mailbox filter (Enter for all)').Trim()
+    Write-Host '  1. All calls'
+    Write-Host '  2. Unsuccessful / uncertain only'
+    $View = (Read-Host 'View [1]').Trim()
+    $Rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($Log in @(Get-DatedLogs -Type STATUS -StartDate $Range.Start -EndDate $Range.End)) {
+        Write-Host ('Reading {0}...' -f $Log.Name) -ForegroundColor DarkGray
+        $Active = @{}
+        $PendingAdd = $null
+        $Handle = $null
+        try {
+            $Handle = New-SharedReader -Path $Log.Path
+            while ($null -ne ($Line = $Handle.Reader.ReadLine())) {
+                if ($Line -match '\[F:FastMessageAdd\]\s+start,.*?Channel:\s*(\d+),\s*CallerIDNumber:\s*([^,]*)') {
+                    $AddChannel = [string]([int]$Matches[1])
+                    $AddCaller = $Matches[2].Trim()
+                    $PendingAdd = $null
+                    if ($Active.ContainsKey($AddChannel) -and $Active[$AddChannel].CallerID -eq $AddCaller) {
+                        $PendingAdd = $AddChannel
+                    }
+                }
+                elseif ($Line -match 'XEEAM_MessageAdd succeeded') {
+                    if ($null -ne $PendingAdd -and $Active.ContainsKey($PendingAdd)) {
+                        $Active[$PendingAdd].Saved = $true
+                        $Active[$PendingAdd].Evidence.Add('FastMessageAdd success')
+                    }
+                    $PendingAdd = $null
+                }
+                elseif ($Line -match '\[F:FastMessageAdd\] end, retval:' -or
+                        $Line -match 'MessageAdd returned\s*=\s*(?!0\b)') {
+                    $PendingAdd = $null
+                }
+                $Ch = Get-ChannelFromLine -Line $Line
+                if ($null -eq $Ch -and $Line -match '<CHAN>(\d+)</CHAN>') { $Ch = [int]$Matches[1] }
+                if ($null -eq $Ch) { continue }
+                $Key = [string]$Ch
+                if ($Line -match 'IDMS!' -and $Line -match '<CALLERID>([^<]+)</CALLERID>') {
+                    if ($Active.ContainsKey($Key)) {
+                        $Prior = $Active[$Key]
+                        $Prior.Incomplete = $true
+                        $Rows.Add((ConvertTo-IxmInboundRow $Prior))
+                    }
+                    $Number = ($Matches[1] -split '[\x00-\x1f]')[0].Trim()
+                    $Called = ''
+                    if ($Line -match '<CALLEDID>([^<]+)</CALLEDID>') { $Called = ($Matches[1] -split '[\x00-\x1f]')[0].Trim() }
+                    $Name = ''
+                    if ($Line -match '<CALLERNAME>([^<]*)</CALLERNAME>') { $Name = $Matches[1] }
+                    $Active[$Key] = [pscustomobject]@{
+                        Channel=$Ch; CallerID=$Number; CallerName=$Name; Mailbox=$Called; MailboxID=''
+                        Start=(Get-LineTime -Line $Line -FileDate $Log.Date); End=$null
+                        Greeting=$false; RecordingAttempts=0; TooShort=0; Saved=$false
+                        HangupDuringGreeting=$false; Ended=$false; Incomplete=$false
+                        Log=$Log.Name; Evidence=(New-Object 'System.Collections.Generic.List[string]')
+                    }
+                    $Active[$Key].Evidence.Add('IDMS')
+                    continue
+                }
+                if (-not $Active.ContainsKey($Key)) { continue }
+                $S = $Active[$Key]
+                if ($Line -match 'ProcessSharedExtension\], mailboxID:\s*(\d+)') { $S.MailboxID=$Matches[1] }
+                if ($Line -match 'State 70 Data: Play Greeting') {
+                    $S.Greeting=$true
+                    $S.Evidence.Add('Greeting started')
+                }
+                if ($Line -match 'Recording Message Mbx\s+(\d+)' -or $Line -match 'Re-Recording Message Mailbox\s+(\d+)') {
+                    $S.Mailbox=$Matches[1]
+                }
+                if ($Line -match 'UMST sckOpen or sckConnected, send command:' -and $Line -match '<CMD>INMSGSTART</CMD>' -and $Line -match ('<CHAN>{0}</CHAN>' -f $Ch)) {
+                    $S.RecordingAttempts++
+                    $S.Evidence.Add('Recording start')
+                }
+                if ($Line -match 'Data: Message too Short Mbx') {
+                    $S.TooShort++
+                    $S.Evidence.Add('Message too Short')
+                }
+                if ($Line -match ('\b{0} FROM:70 TO:304\b' -f $Ch)) {
+                    $S.HangupDuringGreeting=$true
+                    $S.Evidence.Add('70 to 304')
+                }
+                # Background MessageAdd successes cannot safely be assigned to a
+                # channel by proximity; evidence of saved messages is UNKNOWN here.
+                if ($Line -match 'State 304 Data: User hanging up' -or
+                    ($Line -match '<CMD>CALLENDED</CMD>' -and $Line -match ('<CHAN>{0}</CHAN>' -f $Ch))) {
+                    $S.End = Get-LineTime -Line $Line -FileDate $Log.Date
+                    $S.Ended=$true
+                    $S.Evidence.Add('Call ended')
+                    $Rows.Add((ConvertTo-IxmInboundRow $S))
+                    $Active.Remove($Key)
+                }
+            }
+            foreach ($S in $Active.Values) {
+                $S.Incomplete=$true
+                $Rows.Add((ConvertTo-IxmInboundRow $S))
+            }
+        }
+        finally {
+            if ($null -ne $Handle) {
+                if ($null -ne $Handle.Reader) { $Handle.Reader.Dispose() }
+                if ($null -ne $Handle.Stream) { $Handle.Stream.Dispose() }
+            }
+        }
+    }
+    # Cross-check against the existing deposit parser, which requires a
+    # persisted message GUID plus successful MessageAdd and mailbox identity.
+    # This is a second read-only STATUS pass; it is intentional.
+    Write-Host 'Correlating confirmed saved voicemails (second STATUS pass)...' -ForegroundColor DarkGray
+    $Deposits = @(Get-VoicemailDeposits -StartDate $Range.Start -EndDate $Range.End)
+    foreach ($Row in $Rows) {
+        if ($Row.Saved -or [string]::IsNullOrWhiteSpace($Row.CallerID) -or
+            [string]::IsNullOrWhiteSpace($Row.Mailbox) -or
+            [string]::IsNullOrWhiteSpace($Row.End)) { continue }
+        $StartStamp = [datetime]::MinValue
+        $EndStamp = [datetime]::MinValue
+        $Culture = [System.Globalization.CultureInfo]::InvariantCulture
+        if (-not [datetime]::TryParseExact(('{0} {1}' -f $Row.Date,$Row.Start),'MM/dd/yyyy HH:mm:ss',$Culture,[System.Globalization.DateTimeStyles]::None,[ref]$StartStamp)) { continue }
+        if (-not [datetime]::TryParseExact(('{0} {1}' -f $Row.Date,$Row.End),'MM/dd/yyyy HH:mm:ss',$Culture,[System.Globalization.DateTimeStyles]::None,[ref]$EndStamp)) { continue }
+        $NormalizedCaller = $Row.CallerID -replace '[^0-9]',''
+        if ($NormalizedCaller.Length -eq 11 -and $NormalizedCaller.StartsWith('1')) { $NormalizedCaller = $NormalizedCaller.Substring(1) }
+        foreach ($Deposit in $Deposits) {
+            if ($Deposit.Mailbox -ne $Row.Mailbox -or $null -eq $Deposit.EventTime) { continue }
+            if ($Deposit.EventTime -lt $StartStamp.AddSeconds(-2) -or $Deposit.EventTime -gt $EndStamp.AddSeconds(2)) { continue }
+            $SavedCaller = $Deposit.CallerID -replace '[^0-9]',''
+            if ($SavedCaller.Length -eq 11 -and $SavedCaller.StartsWith('1')) { $SavedCaller = $SavedCaller.Substring(1) }
+            if ($NormalizedCaller -ne $SavedCaller) { continue }
+            $Row.Saved = $true
+            $Row.Result = 'VOICEMAIL_SAVED'
+            $Row.Confidence = 'HIGH'
+            $Row.Evidence = $Row.Evidence + ' | Deposit parser: saved message ' + $Deposit.MessageFile
+            break
+        }
+    }
+    $Filtered = @($Rows | Where-Object {
+        ($CallerFilter -eq '' -or $_.CallerID -like ('*'+$CallerFilter+'*')) -and
+        ($MailboxFilter -eq '' -or $_.Mailbox -like ('*'+$MailboxFilter+'*'))
+    } | Sort-Object Date,Start,Channel)
+    if ($View -eq '2') { $Filtered = @($Filtered | Where-Object { $_.Result -ne 'VOICEMAIL_SAVED' }) }
+    Write-Section 'Inbound / Abandoned Call Analysis (STATUS evidence)'
+    if ($Filtered.Count -eq 0) { Write-Host 'No matching inbound calls.' -ForegroundColor Yellow; return }
+    Write-Host 'Outcome summary:' -ForegroundColor Cyan
+    $Filtered | Group-Object Result | Sort-Object Count -Descending | ForEach-Object { Write-Host ('  {0,-38} {1,6}' -f $_.Name,$_.Count) }
+    $Filtered | Select-Object Date,Start,CallerID,Mailbox,Channel,DurationSec,RecordingAttempts,TooShort,Result,Confidence |
+        Format-Table -AutoSize | Out-Host
+    Write-Host 'No saved-message claim is made without channel-specific proof. Silent audio cannot be verified from STATUS alone.' -ForegroundColor Yellow
+    Export-ResultSet -Data $Filtered -BaseName 'ixm_inbound_call_analysis'
+}
+function ConvertTo-IxmInboundRow {
+    param([object]$S)
+    $Result='NO_MESSAGE_UNDETERMINED'; $Confidence='LOW'
+    if ($S.Incomplete -or -not $S.Ended) { $Result='INCOMPLETE_LOG_EVIDENCE' }
+    elseif ($S.Saved) { $Result='VOICEMAIL_SAVED'; $Confidence='HIGH' }
+    elseif ($S.HangupDuringGreeting -and $S.RecordingAttempts -eq 0) {
+        $Result='ABANDONED_DURING_GREETING'; $Confidence='HIGH'
+    }
+    elseif ($S.TooShort -gt 0) {
+        $Result='RECORDING_TOO_SHORT'; $Confidence='HIGH'
+    }
+    elseif ($S.RecordingAttempts -gt 0) {
+        $Result='RECORDING_OUTCOME_UNVERIFIED'; $Confidence='LOW'
+    }
+    elseif ($S.Greeting) { $Result='GREETING_ENDED_NO_RECORDING'; $Confidence='MEDIUM' }
+    $Duration=$null
+    if ($S.Start -and $S.End) { $Duration=[math]::Round(($S.End-$S.Start).TotalSeconds,1) }
+    return [pscustomobject]@{
+        Date=if ($S.Start) {$S.Start.ToString('MM/dd/yyyy')} else {''}
+        Start=if ($S.Start) {$S.Start.ToString('HH:mm:ss')} else {''}
+        End=if ($S.End) {$S.End.ToString('HH:mm:ss')} else {''}
+        DurationSec=$Duration; CallerID=$S.CallerID; CallerName=$S.CallerName
+        Mailbox=$S.Mailbox; MailboxID=$S.MailboxID; Channel=$S.Channel
+        RecordingAttempts=$S.RecordingAttempts; TooShort=$S.TooShort; Saved=$S.Saved
+        Result=$Result; Confidence=$Confidence; Evidence=($S.Evidence -join ' | ')
+        Log=$S.Log
+    }
+}
+
 # -----------------------------------------------------------------------------
 # Main menu
 # -----------------------------------------------------------------------------
@@ -6468,6 +6647,7 @@ do {
     Write-Host ' 12. Current mailbox status / health'
     Write-Host ' 13. Graph / Exchange mailbox failure audit'
     Write-Host ' 14. IX Messaging system health check + HA / MobiLink'
+    Write-Host ' 15. Inbound calls / abandoned voicemail analysis'
     Write-Host '  0. Exit'
     Write-Host ''
 
@@ -6489,6 +6669,7 @@ do {
             '12' { Invoke-CurrentMailboxHealth; Pause-Tool }
             '13' { Invoke-GraphEmailFailureAudit; Pause-Tool }
             '14' { Invoke-IxmSystemHealthCheck; Pause-Tool }
+            '15' { Invoke-IxmInboundCallAnalysis; Pause-Tool }
             '0' { }
             default {
                 Write-Host 'Invalid selection.' -ForegroundColor Yellow

@@ -1,0 +1,41 @@
+name: Publish IXM-Tools PowerShell release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'IXM-Tools.ps1'
+      - '.github/workflows/publish-ixm-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package and publish versioned PS1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m 1 '^[$]ToolVersion = ' IXM-Tools.ps1 | cut -d"'" -f2)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unable to parse valid version from IXM-Tools.ps1" >&2
+            exit 1
+          fi
+          tag="v${version}"
+          asset="IXM-Tools-${tag}.ps1"
+          cp IXM-Tools.ps1 "$asset"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; uploading current script"
+            gh release upload "$tag" "$asset" --clobber
+          else
+            gh release create "$tag" "$asset" \
+              --target "${GITHUB_SHA}" \
+              --title "IXM-Tools ${tag}" \
+              --notes "IXM-Tools ${tag}: read-only IX Messaging troubleshooting. Option 15 analyzes inbound call sessions, abandoned greetings, short-recording retries, and saved voicemail correlation. STATUS-log availability varies by server; verify the correct log drive/path. Requires Windows PowerShell 5.1 or newer."
+          fi
