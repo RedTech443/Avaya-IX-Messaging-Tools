@@ -129,7 +129,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # -----------------------------------------------------------------------------
 
-$ToolVersion = '2.5.5'
+$ToolVersion = '2.5.6'
 $LogRoot = 'X:\UC\logs\VServer'
 
 # CSV fallback is intentionally user-scoped rather than a shared C:\Temp path.
@@ -6548,6 +6548,33 @@ function Invoke-IxmInboundCallAnalysis {
                 if ($null -ne $Handle.Reader) { $Handle.Reader.Dispose() }
                 if ($null -ne $Handle.Stream) { $Handle.Stream.Dispose() }
             }
+        }
+    }
+    # Cross-check against the existing deposit parser, which requires a
+    # persisted message GUID plus successful MessageAdd and mailbox identity.
+    # This is a second read-only STATUS pass; it is intentional.
+    Write-Host 'Correlating confirmed saved voicemails (second STATUS pass)...' -ForegroundColor DarkGray
+    $Deposits = @(Get-VoicemailDeposits -StartDate $Range.Start -EndDate $Range.End)
+    foreach ($Row in $Rows) {
+        if ($Row.Saved -or [string]::IsNullOrWhiteSpace($Row.CallerID) -or
+            [string]::IsNullOrWhiteSpace($Row.Mailbox) -or
+            [string]::IsNullOrWhiteSpace($Row.End)) { continue }
+        $StartStamp = [datetime]::MinValue
+        $EndStamp = [datetime]::MinValue
+        $Culture = [System.Globalization.CultureInfo]::InvariantCulture
+        if (-not [datetime]::TryParseExact(('{0} {1}' -f $Row.Date,$Row.Start),'MM/dd/yyyy HH:mm:ss',$Culture,[System.Globalization.DateTimeStyles]::None,[ref]$StartStamp)) { continue }
+        if (-not [datetime]::TryParseExact(('{0} {1}' -f $Row.Date,$Row.End),'MM/dd/yyyy HH:mm:ss',$Culture,[System.Globalization.DateTimeStyles]::None,[ref]$EndStamp)) { continue }
+        $NormalizedCaller = $Row.CallerID -replace '[^0-9]',''
+        foreach ($Deposit in $Deposits) {
+            if ($Deposit.Mailbox -ne $Row.Mailbox -or $null -eq $Deposit.EventTime) { continue }
+            if ($Deposit.EventTime -lt $StartStamp.AddSeconds(-2) -or $Deposit.EventTime -gt $EndStamp.AddSeconds(2)) { continue }
+            $SavedCaller = $Deposit.CallerID -replace '[^0-9]',''
+            if ($NormalizedCaller -ne $SavedCaller) { continue }
+            $Row.Saved = $true
+            $Row.Result = 'VOICEMAIL_SAVED'
+            $Row.Confidence = 'HIGH'
+            $Row.Evidence = $Row.Evidence + ' | Deposit parser: saved message ' + $Deposit.MessageFile
+            break
         }
     }
     $Filtered = @($Rows | Where-Object {
