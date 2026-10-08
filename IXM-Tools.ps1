@@ -6565,10 +6565,12 @@ function Invoke-IxmInboundCallAnalysis {
         if (-not [datetime]::TryParseExact(('{0} {1}' -f $Row.Date,$Row.Start),'MM/dd/yyyy HH:mm:ss',$Culture,[System.Globalization.DateTimeStyles]::None,[ref]$StartStamp)) { continue }
         if (-not [datetime]::TryParseExact(('{0} {1}' -f $Row.Date,$Row.End),'MM/dd/yyyy HH:mm:ss',$Culture,[System.Globalization.DateTimeStyles]::None,[ref]$EndStamp)) { continue }
         $NormalizedCaller = $Row.CallerID -replace '[^0-9]',''
+        if ($NormalizedCaller.Length -eq 11 -and $NormalizedCaller.StartsWith('1')) { $NormalizedCaller = $NormalizedCaller.Substring(1) }
         foreach ($Deposit in $Deposits) {
             if ($Deposit.Mailbox -ne $Row.Mailbox -or $null -eq $Deposit.EventTime) { continue }
             if ($Deposit.EventTime -lt $StartStamp.AddSeconds(-2) -or $Deposit.EventTime -gt $EndStamp.AddSeconds(2)) { continue }
             $SavedCaller = $Deposit.CallerID -replace '[^0-9]',''
+            if ($SavedCaller.Length -eq 11 -and $SavedCaller.StartsWith('1')) { $SavedCaller = $SavedCaller.Substring(1) }
             if ($NormalizedCaller -ne $SavedCaller) { continue }
             $Row.Saved = $true
             $Row.Result = 'VOICEMAIL_SAVED'
