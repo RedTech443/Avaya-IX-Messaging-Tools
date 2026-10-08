@@ -4,7 +4,7 @@ Private troubleshooting and health-check toolkit for Avaya IX Messaging.
 
 ## Current release
 
-**Version 2.5.4 (feature-branch test build)**
+**Version 2.5.5 (feature-branch test build)**
 
 Repository contents:
 
@@ -50,9 +50,9 @@ The script automatically searches fixed drives when the standard locations are n
 14. IX Messaging system health check + HA / MobiLink
 15. Inbound calls / abandoned voicemail analysis
 
-## Experimental Option 15 (v2.5.4 feature branch)
+## Experimental Option 15 (v2.5.5 feature branch)
 
-Read-only STATUS-log session tracker with optional caller and mailbox filters, CSV export, greeting hang-up and repeated short-recording classifications. Groups attempts under an inbound IDMS call session and closes on CALLENDED/hang-up. **Known limitations:** this first test build does not resolve background MessageAdd success to a session, therefore successful-message status is unverified; STATUS alone cannot prove silent audio or RTP dead air. Incomplete logs are labeled as incomplete. Validate on a test environment before production usage.
+Read-only STATUS-log session tracker with optional caller and mailbox filters, CSV export, greeting hang-up and repeated short-recording classifications. Groups attempts under an inbound IDMS call session and closes on CALLENDED/hang-up. **Known limitations:** this first test build does not resolve background MessageAdd success to a session, therefore successful-message status requires correlation of FastMessageAdd start (caller/channel) and its success marker; unmatched recording status remains unverified; STATUS alone cannot prove silent audio or RTP dead air. Incomplete logs are labeled as incomplete. Validate on a test environment before production usage.
 
 ## Highlights
 
