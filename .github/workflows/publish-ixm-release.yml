@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=$(sed -n "s/^\\$ToolVersion = '\\([^']*\\)'.*/\\1/p" IXM-Tools.ps1 | head -n 1)
+          version=$(grep -m 1 '^[$]ToolVersion = ' IXM-Tools.ps1 | cut -d"'" -f2)
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Unable to parse valid version from IXM-Tools.ps1" >&2
             exit 1
