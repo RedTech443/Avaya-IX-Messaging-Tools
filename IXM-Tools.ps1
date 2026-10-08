@@ -129,7 +129,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # -----------------------------------------------------------------------------
 
-$ToolVersion = '2.5.3'
+$ToolVersion = '2.5.4'
 $LogRoot = 'X:\UC\logs\VServer'
 
 # CSV fallback is intentionally user-scoped rather than a shared C:\Temp path.
@@ -6468,6 +6468,7 @@ do {
     Write-Host ' 12. Current mailbox status / health'
     Write-Host ' 13. Graph / Exchange mailbox failure audit'
     Write-Host ' 14. IX Messaging system health check + HA / MobiLink'
+    Write-Host ' 15. Inbound calls / abandoned voicemail analysis'
     Write-Host '  0. Exit'
     Write-Host ''
 
@@ -6489,6 +6490,7 @@ do {
             '12' { Invoke-CurrentMailboxHealth; Pause-Tool }
             '13' { Invoke-GraphEmailFailureAudit; Pause-Tool }
             '14' { Invoke-IxmSystemHealthCheck; Pause-Tool }
+            '15' { Invoke-IxmInboundCallAnalysis; Pause-Tool }
             '0' { }
             default {
                 Write-Host 'Invalid selection.' -ForegroundColor Yellow
