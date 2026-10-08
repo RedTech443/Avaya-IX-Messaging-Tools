@@ -6492,7 +6492,7 @@ function Invoke-IxmInboundCallAnalysis {
                 if ($Line -match 'Recording Message Mbx\s+(\d+)' -or $Line -match 'Re-Recording Message Mailbox\s+(\d+)') {
                     $S.Mailbox=$Matches[1]
                 }
-                if ($Line -match '<CMD>INMSGSTART</CMD>' -and $Line -match ('<CHAN>{0}</CHAN>' -f $Ch)) {
+                if ($Line -match 'UMST sckOpen or sckConnected, send command:' -and $Line -match '<CMD>INMSGSTART</CMD>' -and $Line -match ('<CHAN>{0}</CHAN>' -f $Ch)) {
                     $S.RecordingAttempts++
                     $S.Evidence.Add('Recording start')
                 }
