@@ -1,10 +1,12 @@
 # Avaya IX Messaging Tools
 
-Private troubleshooting and health-check toolkit for Avaya IX Messaging.
+Read-only PowerShell troubleshooting and health-check toolkit for Avaya IX Messaging. Analyze voicemail deposits, caller activity, abandoned and silent/no-message scenarios, MWI, Microsoft Graph / Exchange integration, SQL Anywhere mailbox state, and high-availability MobiLink synchronization.
 
 ## Current release
 
-**Version 2.5.5 (feature-branch test build)**
+**Version 2.5.6** — current version on `main`.
+
+**Download:** [GitHub Releases](https://github.com/RedTech443/Avaya-IX-Messaging-Tools/releases) (look for `IXM-Tools-v2.5.6.ps1` in the release assets when the publishing workflow completes). The [current source script](IXM-Tools.ps1) is always available on `main`.
 
 Repository contents:
 
@@ -50,9 +52,29 @@ The script automatically searches fixed drives when the standard locations are n
 14. IX Messaging system health check + HA / MobiLink
 15. Inbound calls / abandoned voicemail analysis
 
-## Experimental Option 15 (v2.5.5 feature branch)
+## Option 15 — Inbound call and abandoned voicemail analysis (v2.5.6)
 
-Read-only STATUS-log session tracker with optional caller and mailbox filters, CSV export, greeting hang-up and repeated short-recording classifications. Groups attempts under an inbound IDMS call session and closes on CALLENDED/hang-up. **Known limitations:** this first test build does not resolve background MessageAdd success to a session, therefore successful-message status requires correlation of FastMessageAdd start (caller/channel) and its success marker; unmatched recording status remains unverified; STATUS alone cannot prove silent audio or RTP dead air. Incomplete logs are labeled as incomplete. Validate on a test environment before production usage.
+Option 15 reconstructs inbound call sessions from VServer `STATUS#YYYYMMDD.Log` records and helps answer what happened when a caller reached a mailbox but left no voicemail.
+
+- Filter by caller ID and mailbox/extension; choose all calls or unsuccessful/uncertain calls.
+- Show start time, duration, channel, recording attempts, rejected-too-short attempts, outcome and confidence.
+- Classify greeting disconnects, calls with no recording, repeated too-short recordings, saved voicemails, and uncertain/incomplete sessions.
+- Cross-check saved-voicemail evidence against the existing deposit parser using caller ID, mailbox and the call time window; normalize common US +1 caller-number formats.
+- Summarize call outcomes and optionally export detailed evidence to CSV.
+- Keep multiple recording attempts within the same call session instead of counting them as separate calls.
+
+**Interpretation and limits:** A `RECORDING_TOO_SHORT` event identifies a recording attempt rejected by IX Messaging; it is not an audio-level measurement. A recording's elapsed duration does not independently establish what the caller said, nor can STATUS logs prove silence, media dead air or spam intent. Saved voicemail correlation relies on matching caller, mailbox, and time to the separate deposit parser, rather than a universally available channel-specific storage transaction. Investigate ambiguous results against the raw logs.
+
+**Log discovery:** The application scans the local server's selected VServer log root. A Voice Server using `X:\\UC\\logs\\VServer` is not guaranteed to contain the same call records as another server using `E:\\UC\\logs\\VServer`. In HA environments, each server may have a different subset of calls. Only retained, uncompressed date-named STATUS logs matching the search period can be analyzed. One day of displayed coverage means only one matching date was discovered there, not necessarily a system-wide one-day retention policy.
+
+### Getting started
+
+1. Download the versioned `.ps1` file from [Releases](https://github.com/RedTech443/Avaya-IX-Messaging-Tools/releases) or use the current [source](IXM-Tools.ps1).
+2. Run in Windows PowerShell 5.1 with read access to the appropriate IX Messaging logs.
+3. Choose menu **15**, select a date range, and optionally enter the caller ID or destination mailbox.
+4. Review the summary, then export a CSV if needed for a customer troubleshooting record.
+
+The tool is intended for read-only investigation. Validate new call-flow classifications against representative customer logs before relying on them for incident conclusions.
 
 ## Highlights
 
@@ -139,4 +161,4 @@ Results are limited by available log retention. Missing or rotated logs are not 
 
 Health-check thresholds are diagnostic thresholds used by this utility and are not Avaya support policy.
 
-This repository is intentionally kept minimal and contains only the current script, README, changelog, and current user guide.
+This repository contains the current script, README, changelog, user guide, and a GitHub Actions workflow for publishing a versioned PowerShell asset to Releases. The user guide currently documents v2.5.3 and has not yet been updated for Option 15.
