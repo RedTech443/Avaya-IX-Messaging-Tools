@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.5.5 (experimental feature branch)
+
+- Option 15 now correlates background FastMessageAdd success to an explicitly identified caller and IXM channel.
+- Saved voicemail classification takes precedence over earlier too-short recording attempts.
+- Adds per-outcome summary counts and a results filter for unsuccessful/uncertain calls.
+- Still requires Windows PowerShell 5.1 production-log validation before merge.
+
+
 ## 2.5.4 (experimental feature branch)
 
 - Add read-only Option 15 for inbound call sessions using STATUS/IDMS and channel state events.
