@@ -129,7 +129,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # -----------------------------------------------------------------------------
 
-$ToolVersion = '2.5.4'
+$ToolVersion = '2.5.5'
 $LogRoot = 'X:\UC\logs\VServer'
 
 # CSV fallback is intentionally user-scoped rather than a shared C:\Temp path.
@@ -6449,14 +6449,37 @@ function Invoke-IxmInboundCallAnalysis {
     $Range = Read-DateRange -CoverageMode STATUS
     $CallerFilter = (Read-Host 'Caller ID filter (Enter for all)').Trim()
     $MailboxFilter = (Read-Host 'Mailbox filter (Enter for all)').Trim()
+    Write-Host '  1. All calls'
+    Write-Host '  2. Unsuccessful / uncertain only'
+    $View = (Read-Host 'View [1]').Trim()
     $Rows = New-Object 'System.Collections.Generic.List[object]'
     foreach ($Log in @(Get-DatedLogs -Type STATUS -StartDate $Range.Start -EndDate $Range.End)) {
         Write-Host ('Reading {0}...' -f $Log.Name) -ForegroundColor DarkGray
         $Active = @{}
+        $PendingAdd = $null
         $Handle = $null
         try {
             $Handle = New-SharedReader -Path $Log.Path
             while ($null -ne ($Line = $Handle.Reader.ReadLine())) {
+                if ($Line -match '\[F:FastMessageAdd\]\s+start,.*?Channel:\s*(\d+),\s*CallerIDNumber:\s*([^,]*)') {
+                    $AddChannel = [string]([int]$Matches[1])
+                    $AddCaller = $Matches[2].Trim()
+                    $PendingAdd = $null
+                    if ($Active.ContainsKey($AddChannel) -and $Active[$AddChannel].CallerID -eq $AddCaller) {
+                        $PendingAdd = $AddChannel
+                    }
+                }
+                elseif ($Line -match 'XEEAM_MessageAdd succeeded') {
+                    if ($null -ne $PendingAdd -and $Active.ContainsKey($PendingAdd)) {
+                        $Active[$PendingAdd].Saved = $true
+                        $Active[$PendingAdd].Evidence.Add('FastMessageAdd success')
+                    }
+                    $PendingAdd = $null
+                }
+                elseif ($Line -match '\[F:FastMessageAdd\] end, retval:' -or
+                        $Line -match 'MessageAdd returned\s*=\s*(?!0\b)') {
+                    $PendingAdd = $null
+                }
                 $Ch = Get-ChannelFromLine -Line $Line
                 if ($null -eq $Ch -and $Line -match '<CHAN>(\d+)</CHAN>') { $Ch = [int]$Matches[1] }
                 if ($null -eq $Ch) { continue }
@@ -6531,8 +6554,11 @@ function Invoke-IxmInboundCallAnalysis {
         ($CallerFilter -eq '' -or $_.CallerID -like ('*'+$CallerFilter+'*')) -and
         ($MailboxFilter -eq '' -or $_.Mailbox -like ('*'+$MailboxFilter+'*'))
     } | Sort-Object Date,Start,Channel)
+    if ($View -eq '2') { $Filtered = @($Filtered | Where-Object { $_.Result -ne 'VOICEMAIL_SAVED' }) }
     Write-Section 'Inbound / Abandoned Call Analysis (STATUS evidence)'
     if ($Filtered.Count -eq 0) { Write-Host 'No matching inbound calls.' -ForegroundColor Yellow; return }
+    Write-Host 'Outcome summary:' -ForegroundColor Cyan
+    $Filtered | Group-Object Result | Sort-Object Count -Descending | ForEach-Object { Write-Host ('  {0,-38} {1,6}' -f $_.Name,$_.Count) }
     $Filtered | Select-Object Date,Start,CallerID,Mailbox,Channel,DurationSec,RecordingAttempts,TooShort,Result,Confidence |
         Format-Table -AutoSize | Out-Host
     Write-Host 'No saved-message claim is made without channel-specific proof. Silent audio cannot be verified from STATUS alone.' -ForegroundColor Yellow
@@ -6542,6 +6568,7 @@ function ConvertTo-IxmInboundRow {
     param([object]$S)
     $Result='NO_MESSAGE_UNDETERMINED'; $Confidence='LOW'
     if ($S.Incomplete -or -not $S.Ended) { $Result='INCOMPLETE_LOG_EVIDENCE' }
+    elseif ($S.Saved) { $Result='VOICEMAIL_SAVED'; $Confidence='HIGH' }
     elseif ($S.HangupDuringGreeting -and $S.RecordingAttempts -eq 0) {
         $Result='ABANDONED_DURING_GREETING'; $Confidence='HIGH'
     }
@@ -6560,7 +6587,7 @@ function ConvertTo-IxmInboundRow {
         End=if ($S.End) {$S.End.ToString('HH:mm:ss')} else {''}
         DurationSec=$Duration; CallerID=$S.CallerID; CallerName=$S.CallerName
         Mailbox=$S.Mailbox; MailboxID=$S.MailboxID; Channel=$S.Channel
-        RecordingAttempts=$S.RecordingAttempts; TooShort=$S.TooShort
+        RecordingAttempts=$S.RecordingAttempts; TooShort=$S.TooShort; Saved=$S.Saved
         Result=$Result; Confidence=$Confidence; Evidence=($S.Evidence -join ' | ')
         Log=$S.Log
     }
