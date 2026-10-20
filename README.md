@@ -4,16 +4,16 @@ Read-only PowerShell troubleshooting and health-check toolkit for Avaya IX Messa
 
 ## Current release
 
-**Version 2.5.6** — current version on `main`.
+**Version 2.5.7** — current version on `main`.
 
-**Download:** [GitHub Releases](https://github.com/RedTech443/Avaya-IX-Messaging-Tools/releases) (look for `IXM-Tools-v2.5.6.ps1` in the release assets when the publishing workflow completes). The [current source script](IXM-Tools.ps1) is always available on `main`.
+**Download:** [GitHub Releases](https://github.com/RedTech443/Avaya-IX-Messaging-Tools/releases) (look for `IXM-Tools-v2.5.7.ps1` in the release assets when the publishing workflow completes). The [current source script](IXM-Tools.ps1) is always available on `main`.
 
 Repository contents:
 
 - `IXM-Tools.ps1` — current PowerShell tool
 - `README.md` — project overview
 - `CHANGELOG.md` — release history
-- `docs/User_Guide_v2.5.3.md` — previous stable guide (Option 15 not yet documented)
+- `docs/User_Guide_v2.5.7.md` — current user guide
 
 Older versioned scripts, checksums, analyzer settings, and older guides are intentionally not retained in the repository.
 
@@ -52,6 +52,20 @@ The script automatically searches fixed drives when the standard locations are n
 14. IX Messaging system health check + HA / MobiLink
 15. Inbound calls / abandoned voicemail analysis
 
+## Archive-aware retained log searching (v2.5.7)
+
+Version 2.5.7 extends date-range searches beyond the live log directories. IX Messaging daily backup ZIPs under `<drive>:\UC\logs\Backup` are included automatically.
+
+- `DD-VServer.zip`: archived STATUS, RVSIP and SIP logs used by Options 1-9 and 15
+- `DD-DBCOM.zip`: archived Graph/email synchronization logs used by Option 10
+- `DD-CSE.zip`: archived Graph/Exchange error logs used by Option 13
+
+The tool does **not** infer the month or year from the ZIP's day-number prefix. It reads the complete date from the archived log filename itself, such as `STATUS#YYYYMMDD.Log` or `ERR.SESGRFM.YYYY-MM-DDTHH.csv`. This matters because the backup set rolls through day numbers 01-31.
+
+Live logs take precedence over archived duplicates. Coverage checks index ZIP metadata without expanding every archive. When a selected search needs an archived file, only that entry is extracted into a process-specific temporary directory and reused for the session. The original ZIP is never modified.
+
+As a result, **Last X days** and **Custom date range** now include retained ZIP backups transparently.
+
 ## Option 15 — Inbound call and abandoned voicemail analysis (v2.5.6)
 
 Option 15 reconstructs inbound call sessions from VServer `STATUS#YYYYMMDD.Log` records and helps answer what happened when a caller reached a mailbox but left no voicemail.
@@ -65,7 +79,7 @@ Option 15 reconstructs inbound call sessions from VServer `STATUS#YYYYMMDD.Log` 
 
 **Interpretation and limits:** A `RECORDING_TOO_SHORT` event identifies a recording attempt rejected by IX Messaging; it is not an audio-level measurement. A recording's elapsed duration does not independently establish what the caller said, nor can STATUS logs prove silence, media dead air or spam intent. Saved voicemail correlation relies on matching caller, mailbox, and time to the separate deposit parser, rather than a universally available channel-specific storage transaction. Investigate ambiguous results against the raw logs.
 
-**Log discovery:** The application scans the local server's selected VServer log root. A Voice Server using `X:\\UC\\logs\\VServer` is not guaranteed to contain the same call records as another server using `E:\\UC\\logs\\VServer`. In HA environments, each server may have a different subset of calls. Only retained, uncompressed date-named STATUS logs matching the search period can be analyzed. One day of displayed coverage means only one matching date was discovered there, not necessarily a system-wide one-day retention policy.
+**Log discovery:** The application scans the local server's selected VServer log root. A Voice Server using `X:\\UC\\logs\\VServer` is not guaranteed to contain the same call records as another server using `E:\\UC\\logs\\VServer`. In HA environments, each server may have a different subset of calls. Version 2.5.7 searches both live date-named STATUS logs and matching retained entries in `UC\\logs\\Backup\\*-VServer.zip`. Coverage reflects both sources; a day is missing only when no matching dated STATUS log is found live or in the retained VServer ZIPs.
 
 ### Getting started
 
