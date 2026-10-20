@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.5.7
+
+Archive-aware retained-log search release.
+
+- Add transparent discovery of IX Messaging daily backup ZIPs under `UC\logs\Backup`.
+- Search `*-VServer.zip` for archived STATUS, RVSIP and SIP logs used by Options 1-9 and 15.
+- Search `*-DBCOM.zip` for archived Graph/email synchronization logs used by Option 10.
+- Search `*-CSE.zip` for archived Graph/Exchange error logs used by Option 13.
+- Determine the real log date from the full dated filename inside the ZIP instead of assuming the `DD-*.zip` filename identifies month/year.
+- Prefer live log files when both live and archived copies exist.
+- Include archived files in retained-log coverage and maximum-lookback calculations.
+- Index ZIP metadata without extracting every archive.
+- Extract only selected archive entries to a process-specific temporary working directory and clean it up on normal exit.
+- Keep all archive access read-only; original ZIP files are never modified.
+
+## 2.5.6
+
+- Merge the inbound-call / abandoned-voicemail analysis as Option 15.
+- Reconstruct inbound VServer STATUS call sessions by channel.
+- Correlate greeting, recording, too-short recording and call-end evidence.
+- Correlate confirmed saved voicemails using FastMessageAdd and the existing voicemail-deposit parser.
+- Add caller/mailbox filters, outcome summary, confidence and CSV export.
+- Preserve conservative wording where STATUS evidence cannot prove silence, media dead air or caller intent.
+
 ## 2.5.5 (experimental feature branch)
 
 - Option 15 now correlates background FastMessageAdd success to an explicitly identified caller and IXM channel.
