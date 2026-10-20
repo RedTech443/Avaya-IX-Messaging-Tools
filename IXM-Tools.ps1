@@ -113,6 +113,20 @@
         installation is not incorrectly failed for missing HA/MobiLink components.
 
 
+
+    Version 2.5.8 improves retained-log coverage reporting:
+      - Separates the oldest historical evidence from continuous searchable
+        coverage extending backward from today.
+      - Stops describing an isolated old retained file as the maximum useful
+        lookback when gaps exist between that file and current retention.
+      - Shows the continuous coverage start date and day count.
+      - After a date range is selected, reports requested days, available days,
+        COMPLETE / PARTIAL / NONE coverage, missing dates within that selected
+        range, and live-versus-archive file counts before parsing begins.
+      - A Last X days search may intentionally extend beyond continuous
+        coverage; the tool warns about actual gaps instead of rejecting the
+        request solely because the range is not continuous.
+
     Version 2.5.7 adds transparent retained-log ZIP archive searching:
       - Searches the live log directories first, then UC\logs\Backup daily ZIPs.
       - Supports *-VServer.zip for STATUS/RVSIP/SIP, *-DBCOM.zip for Graph/email
@@ -142,7 +156,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # -----------------------------------------------------------------------------
 
-$ToolVersion = '2.5.7'
+$ToolVersion = '2.5.8'
 $LogRoot = 'X:\UC\logs\VServer'
 
 # CSV fallback is intentionally user-scoped rather than a shared C:\Temp path.
@@ -229,6 +243,7 @@ function Confirm-IxmLargeSearchRange {
     }
 }
 
+
 function Read-DateRange {
     param(
         [ValidateSet('STATUS','MWI','LIFECYCLE','ALL')]
@@ -240,19 +255,28 @@ function Read-DateRange {
     Write-Host ''
     if ($Coverage.HasData) {
         Write-Host ('Available {0} log coverage:' -f $Coverage.Label) -ForegroundColor Cyan
-        Write-Host ('  Oldest retained date  : {0}' -f $Coverage.Oldest.ToString('MM/dd/yyyy'))
-        Write-Host ('  Newest retained date  : {0}' -f $Coverage.Newest.ToString('MM/dd/yyyy'))
-        Write-Host ('  Dated log days        : {0}' -f $Coverage.DateCount)
-        Write-Host ('  Calendar span         : {0} day(s)' -f $Coverage.CalendarSpanDays)
-        Write-Host ('  Max lookback from today: {0} day(s)' -f $Coverage.MaxLookbackDays) -ForegroundColor Green
+        Write-Host ('  Oldest historical date : {0}' -f $Coverage.Oldest.ToString('MM/dd/yyyy'))
+        Write-Host ('  Newest retained date    : {0}' -f $Coverage.Newest.ToString('MM/dd/yyyy'))
+        Write-Host ('  Historical retained days: {0}' -f $Coverage.DateCount)
+        Write-Host ('  Historical calendar span: {0} day(s)' -f $Coverage.CalendarSpanDays)
+
+        if ($Coverage.ContinuousLookbackDays -gt 0) {
+            Write-Host ('  Continuous coverage     : {0} through {1}' -f $Coverage.ContinuousStart.ToString('MM/dd/yyyy'),(Get-Date).Date.ToString('MM/dd/yyyy')) -ForegroundColor Green
+            Write-Host ('  Continuous lookback     : {0} day(s)' -f $Coverage.ContinuousLookbackDays) -ForegroundColor Green
+        }
+        else {
+            Write-Host '  Continuous lookback     : 0 day(s) from today' -ForegroundColor Yellow
+        }
 
         if ($Coverage.MissingDates.Count -gt 0) {
+            Write-Host ('  Historical gaps         : {0} day(s)' -f $Coverage.MissingDates.Count) -ForegroundColor Yellow
             $Preview = @($Coverage.MissingDates | Select-Object -First 8 | ForEach-Object { $_.ToString('MM/dd/yyyy') })
             $Suffix = ''
             if ($Coverage.MissingDates.Count -gt 8) {
                 $Suffix = (' ... +{0} more' -f ($Coverage.MissingDates.Count - 8))
             }
-            Write-Host ('  Missing dated log days: {0}{1}' -f ($Preview -join ', '),$Suffix) -ForegroundColor Yellow
+            Write-Host ('  Gap examples            : {0}{1}' -f ($Preview -join ', '),$Suffix) -ForegroundColor DarkYellow
+            Write-Host '  Historical gaps do not affect a selected range unless that range includes them.' -ForegroundColor DarkGray
         }
 
         if (-not $Coverage.HasToday) {
@@ -266,8 +290,8 @@ function Read-DateRange {
     Write-Host ''
     Write-Host 'Search period:' -ForegroundColor Cyan
     Write-Host '  1. Current day'
-    if ($Coverage.HasData) {
-        Write-Host ('  2. Last X days (maximum useful lookback: {0})' -f $Coverage.MaxLookbackDays)
+    if ($Coverage.HasData -and $Coverage.ContinuousLookbackDays -gt 0) {
+        Write-Host ('  2. Last X days (continuous retained coverage: {0} day(s))' -f $Coverage.ContinuousLookbackDays)
     }
     else {
         Write-Host '  2. Last X days'
@@ -283,22 +307,22 @@ function Read-DateRange {
     $Today = (Get-Date).Date
 
     if ($Choice -eq '1') {
-        if ($Coverage.HasData -and -not $Coverage.HasToday) {
-            Write-Host ('WARNING: No matching dated log file exists for today. Newest available date is {0}.' -f $Coverage.Newest.ToString('MM/dd/yyyy')) -ForegroundColor Yellow
-        }
-
         $Result = New-Object PSObject -Property @{
             Start = $Today
             End = $Today
             Description = 'today'
         }
+
+        [void](Show-IxmSelectedRangeCoverage -Mode $CoverageMode -StartDate $Result.Start -EndDate $Result.End)
         return $Result
     }
 
     if ($Choice -eq '2') {
         $DefaultDays = 7
-        if ($Coverage.HasData -and $Coverage.MaxLookbackDays -lt $DefaultDays) {
-            $DefaultDays = $Coverage.MaxLookbackDays
+        if ($Coverage.HasData -and
+            $Coverage.ContinuousLookbackDays -gt 0 -and
+            $Coverage.ContinuousLookbackDays -lt $DefaultDays) {
+            $DefaultDays = $Coverage.ContinuousLookbackDays
         }
         if ($DefaultDays -lt 1) { $DefaultDays = 1 }
 
@@ -313,10 +337,6 @@ function Read-DateRange {
                 $Days = [int]$Text
                 if ($Days -le 0) {
                     Write-Host 'Enter a number greater than zero.' -ForegroundColor Yellow
-                }
-                elseif ($Coverage.HasData -and $Days -gt $Coverage.MaxLookbackDays) {
-                    Write-Host ('Only {0} day(s) can be searched from today based on the oldest retained {1} log date ({2}).' -f $Coverage.MaxLookbackDays,$Coverage.Label,$Coverage.Oldest.ToString('MM/dd/yyyy')) -ForegroundColor Yellow
-                    $Days = 0
                 }
             }
             else {
@@ -333,12 +353,14 @@ function Read-DateRange {
             End = $Today
             Description = ('last {0} day(s)' -f $Days)
         }
+
+        [void](Show-IxmSelectedRangeCoverage -Mode $CoverageMode -StartDate $Result.Start -EndDate $Result.End)
         return $Result
     }
 
     $StartDate = $null
     while ($null -eq $StartDate) {
-        $StartText = (Read-Host 'Start date (MM/dd/yyyy or yyyy-MM-dd)').Trim()
+        $StartText = (Read-Host 'Start date (MM/DD/YYYY or yyyy-MM-dd)').Trim()
         try {
             $StartDate = ([datetime]$StartText).Date
         }
@@ -350,7 +372,7 @@ function Read-DateRange {
 
     $EndDate = $null
     while ($null -eq $EndDate) {
-        $EndText = (Read-Host 'End date (MM/dd/yyyy or yyyy-MM-dd)').Trim()
+        $EndText = (Read-Host 'End date (MM/DD/YYYY or yyyy-MM-dd)').Trim()
         try {
             $CandidateEnd = ([datetime]$EndText).Date
             if ($CandidateEnd -lt $StartDate) {
@@ -366,10 +388,6 @@ function Read-DateRange {
         }
     }
 
-    if ($Coverage.HasData -and ($StartDate -lt $Coverage.Oldest -or $EndDate -gt $Coverage.Newest)) {
-        Write-Host ('WARNING: Selected range extends beyond retained {0} log dates ({1} through {2}). Results will only reflect available logs.' -f $Coverage.Label,$Coverage.Oldest.ToString('MM/dd/yyyy'),$Coverage.Newest.ToString('MM/dd/yyyy')) -ForegroundColor Yellow
-    }
-
     Confirm-IxmLargeSearchRange -StartDate $StartDate -EndDate $EndDate -Context ('{0} retained-log search' -f $Coverage.Label)
 
     $Result = New-Object PSObject -Property @{
@@ -377,12 +395,10 @@ function Read-DateRange {
         End = $EndDate
         Description = ('{0} through {1}' -f $StartDate.ToString('MM/dd/yyyy'), $EndDate.ToString('MM/dd/yyyy'))
     }
+
+    [void](Show-IxmSelectedRangeCoverage -Mode $CoverageMode -StartDate $Result.Start -EndDate $Result.End)
     return $Result
 }
-
-# -----------------------------------------------------------------------------
-# File helpers
-# -----------------------------------------------------------------------------
 
 function New-SharedReader {
     param([Parameter(Mandatory)][string]$Path)
@@ -737,6 +753,7 @@ function Get-DatedLogs {
     return @($Results.ToArray() | Sort-Object Date,Name)
 }
 
+
 function Get-SearchCoverage {
     param(
         [Parameter(Mandatory)]
@@ -747,9 +764,12 @@ function Get-SearchCoverage {
     $MinDate = [datetime]'1900-01-01'
     $MaxDate = [datetime]'2999-12-31'
 
-    $StatusDates = @(
+    $StatusObjects = @(
         Get-DatedLogs -Type STATUS -StartDate $MinDate -EndDate $MaxDate -MetadataOnly |
-        Where-Object { $_.Length -gt 0 } |
+        Where-Object { $_.Length -gt 0 }
+    )
+    $StatusDates = @(
+        $StatusObjects |
         ForEach-Object { $_.Date.Date } |
         Sort-Object -Unique
     )
@@ -757,10 +777,10 @@ function Get-SearchCoverage {
     $MWILogObjects = @()
     $MWILogObjects += @(Get-DatedLogs -Type RVSIP -StartDate $MinDate -EndDate $MaxDate -MetadataOnly)
     $MWILogObjects += @(Get-DatedLogs -Type SIP -StartDate $MinDate -EndDate $MaxDate -MetadataOnly)
+    $MWILogObjects = @($MWILogObjects | Where-Object { $_.Length -gt 0 })
 
     $MWIDates = @(
         $MWILogObjects |
-        Where-Object { $_.Length -gt 0 } |
         ForEach-Object { $_.Date.Date } |
         Sort-Object -Unique
     )
@@ -800,18 +820,25 @@ function Get-SearchCoverage {
             Newest = $null
             DateCount = 0
             CalendarSpanDays = 0
-            MaxLookbackDays = 0
+            HistoricalSpanFromTodayDays = 0
+            ContinuousLookbackDays = 0
+            ContinuousStart = $null
             HasToday = $false
             MissingDates = @()
+            AvailableDates = @()
         }
     }
 
-    $Oldest = ($Dates | Sort-Object | Select-Object -First 1).Date
-    $Newest = ($Dates | Sort-Object | Select-Object -Last 1).Date
+    $Dates = @($Dates | Sort-Object -Unique)
+    $Oldest = ($Dates | Select-Object -First 1).Date
+    $Newest = ($Dates | Select-Object -Last 1).Date
     $Today = (Get-Date).Date
     $CalendarSpanDays = [int](($Newest - $Oldest).TotalDays) + 1
-    $MaxLookbackDays = [int](($Today - $Oldest).TotalDays) + 1
-    if ($MaxLookbackDays -lt 1) { $MaxLookbackDays = 1 }
+
+    $HistoricalSpanFromTodayDays = 0
+    if ($Oldest -le $Today) {
+        $HistoricalSpanFromTodayDays = [int](($Today - $Oldest).TotalDays) + 1
+    }
 
     $MissingDates = @()
     $Cursor = $Oldest
@@ -822,6 +849,16 @@ function Get-SearchCoverage {
         $Cursor = $Cursor.AddDays(1)
     }
 
+    $ContinuousLookbackDays = 0
+    $ContinuousStart = $null
+    $Cursor = $Today
+
+    while ($Dates -contains $Cursor) {
+        $ContinuousLookbackDays++
+        $ContinuousStart = $Cursor
+        $Cursor = $Cursor.AddDays(-1)
+    }
+
     return [pscustomobject]@{
         Mode = $Mode
         Label = $Label
@@ -830,10 +867,155 @@ function Get-SearchCoverage {
         Newest = $Newest
         DateCount = $Dates.Count
         CalendarSpanDays = $CalendarSpanDays
-        MaxLookbackDays = $MaxLookbackDays
+        HistoricalSpanFromTodayDays = $HistoricalSpanFromTodayDays
+        ContinuousLookbackDays = $ContinuousLookbackDays
+        ContinuousStart = $ContinuousStart
         HasToday = ($Dates -contains $Today)
         MissingDates = @($MissingDates)
+        AvailableDates = @($Dates)
     }
+}
+
+function Get-IxmSelectedRangeCoverage {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('STATUS','MWI','LIFECYCLE','ALL')]
+        [string]$Mode,
+
+        [Parameter(Mandatory)][datetime]$StartDate,
+        [Parameter(Mandatory)][datetime]$EndDate
+    )
+
+    $Start = $StartDate.Date
+    $End = $EndDate.Date
+    $RequestedDates = New-Object System.Collections.Generic.List[datetime]
+
+    $Cursor = $Start
+    while ($Cursor -le $End) {
+        $RequestedDates.Add($Cursor)
+        $Cursor = $Cursor.AddDays(1)
+    }
+
+    $StatusObjects = @(
+        Get-DatedLogs -Type STATUS -StartDate $Start -EndDate $End -MetadataOnly |
+        Where-Object { $_.Length -gt 0 }
+    )
+    $MwiObjects = @()
+    $MwiObjects += @(
+        Get-DatedLogs -Type RVSIP -StartDate $Start -EndDate $End -MetadataOnly |
+        Where-Object { $_.Length -gt 0 }
+    )
+    $MwiObjects += @(
+        Get-DatedLogs -Type SIP -StartDate $Start -EndDate $End -MetadataOnly |
+        Where-Object { $_.Length -gt 0 }
+    )
+
+    $StatusDates = @($StatusObjects | ForEach-Object { $_.Date.Date } | Sort-Object -Unique)
+    $MwiDates = @($MwiObjects | ForEach-Object { $_.Date.Date } | Sort-Object -Unique)
+
+    switch ($Mode) {
+        'STATUS' {
+            $AvailableDates = @($StatusDates)
+            $RelevantObjects = @($StatusObjects)
+        }
+        'MWI' {
+            $AvailableDates = @($MwiDates)
+            $RelevantObjects = @($MwiObjects)
+        }
+        'LIFECYCLE' {
+            $AvailableDates = @(
+                $StatusDates |
+                Where-Object { $MwiDates -contains $_ } |
+                Sort-Object -Unique
+            )
+            $RelevantObjects = @(
+                @($StatusObjects) + @($MwiObjects) |
+                Where-Object { $AvailableDates -contains $_.Date.Date }
+            )
+        }
+        default {
+            $AllDates = @()
+            $AllDates += @($StatusDates)
+            $AllDates += @($MwiDates)
+            $AvailableDates = @($AllDates | Sort-Object -Unique)
+            $RelevantObjects = @(@($StatusObjects) + @($MwiObjects))
+        }
+    }
+
+    $MissingDates = @(
+        $RequestedDates.ToArray() |
+        Where-Object { $AvailableDates -notcontains $_ }
+    )
+
+    $RequestedCount = $RequestedDates.Count
+    $AvailableCount = $RequestedCount - $MissingDates.Count
+
+    $CoverageState = 'NONE'
+    if ($AvailableCount -eq $RequestedCount -and $RequestedCount -gt 0) {
+        $CoverageState = 'COMPLETE'
+    }
+    elseif ($AvailableCount -gt 0) {
+        $CoverageState = 'PARTIAL'
+    }
+
+    $LiveFiles = @($RelevantObjects | Where-Object { $_.Source -eq 'Live' }).Count
+    $ArchiveFiles = @($RelevantObjects | Where-Object { $_.Source -eq 'Archive' }).Count
+
+    return [pscustomobject]@{
+        Mode = $Mode
+        Start = $Start
+        End = $End
+        RequestedDays = $RequestedCount
+        AvailableDays = $AvailableCount
+        MissingDays = $MissingDates.Count
+        MissingDates = @($MissingDates)
+        Coverage = $CoverageState
+        LiveFiles = $LiveFiles
+        ArchiveFiles = $ArchiveFiles
+    }
+}
+
+function Show-IxmSelectedRangeCoverage {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('STATUS','MWI','LIFECYCLE','ALL')]
+        [string]$Mode,
+
+        [Parameter(Mandatory)][datetime]$StartDate,
+        [Parameter(Mandatory)][datetime]$EndDate
+    )
+
+    $RangeCoverage = Get-IxmSelectedRangeCoverage -Mode $Mode -StartDate $StartDate -EndDate $EndDate
+
+    Write-Host ''
+    Write-Host 'Selected range coverage:' -ForegroundColor Cyan
+    Write-Host ('  Range          : {0} through {1}' -f $RangeCoverage.Start.ToString('MM/dd/yyyy'),$RangeCoverage.End.ToString('MM/dd/yyyy'))
+    Write-Host ('  Requested days : {0}' -f $RangeCoverage.RequestedDays)
+    Write-Host ('  Available days : {0} of {1}' -f $RangeCoverage.AvailableDays,$RangeCoverage.RequestedDays)
+
+    $CoverageColor = 'Yellow'
+    if ($RangeCoverage.Coverage -eq 'COMPLETE') { $CoverageColor = 'Green' }
+    elseif ($RangeCoverage.Coverage -eq 'NONE') { $CoverageColor = 'Red' }
+
+    Write-Host ('  Coverage       : {0}' -f $RangeCoverage.Coverage) -ForegroundColor $CoverageColor
+    Write-Host ('  Matching files : {0} live / {1} archived' -f $RangeCoverage.LiveFiles,$RangeCoverage.ArchiveFiles)
+
+    if ($RangeCoverage.MissingDates.Count -gt 0) {
+        $Preview = @(
+            $RangeCoverage.MissingDates |
+            Select-Object -First 10 |
+            ForEach-Object { $_.ToString('MM/dd/yyyy') }
+        )
+        $Suffix = ''
+        if ($RangeCoverage.MissingDates.Count -gt 10) {
+            $Suffix = (' ... +{0} more' -f ($RangeCoverage.MissingDates.Count - 10))
+        }
+
+        Write-Host ('  Missing dates  : {0}{1}' -f ($Preview -join ', '),$Suffix) -ForegroundColor Yellow
+        Write-Host '  Results for this search will only reflect the available dates above.' -ForegroundColor Yellow
+    }
+
+    return $RangeCoverage
 }
 
 function Get-LineTime {
