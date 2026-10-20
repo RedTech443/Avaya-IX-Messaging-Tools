@@ -31,6 +31,7 @@
       - Log coverage / diagnostics
       - Date prompts show retained-log coverage and maximum searchable lookback
       - Optional CSV export
+      - Transparent search of retained VServer, DBCOM, and CSE logs stored in daily ZIP backups
 
     Voicemail deposits are identified from STATUS logs by correlating:
       INMSGSTART / INMSGEND
@@ -111,6 +112,18 @@
       - Refines topology before role-specific service checks so a true single-server
         installation is not incorrectly failed for missing HA/MobiLink components.
 
+
+    Version 2.5.7 adds transparent retained-log ZIP archive searching:
+      - Searches the live log directories first, then UC\logs\Backup daily ZIPs.
+      - Supports *-VServer.zip for STATUS/RVSIP/SIP, *-DBCOM.zip for Graph/email
+        synchronization logs, and *-CSE.zip for Graph/CSE error auditing.
+      - Uses the full date embedded in each archived log filename rather than
+        assuming the DD-*.zip filename identifies the month or year.
+      - Live files take precedence when the same dated log also exists in a ZIP.
+      - Coverage/date prompts include archived logs without extracting every ZIP.
+      - Only archive entries required by the selected search are materialized to
+        a process-specific temporary directory, which is removed on normal exit.
+
     Authenticode signing is a deployment control and is not added automatically.
     For audited customer deployments, sign the release with the organization's
     code-signing certificate and use a SQL Anywhere identity limited to SELECT.
@@ -129,7 +142,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # -----------------------------------------------------------------------------
 
-$ToolVersion = '2.5.6'
+$ToolVersion = '2.5.7'
 $LogRoot = 'X:\UC\logs\VServer'
 
 # CSV fallback is intentionally user-scoped rather than a shared C:\Temp path.
@@ -156,6 +169,9 @@ $script:AllMWICache = @{}
 $script:GraphSyncCache = @{}
 $script:LastExportDirectory = $null
 $script:CseGraphRoot = $null
+$script:ArchiveIndexCache = @{}
+$script:ArchiveExtractCache = @{}
+$script:ArchiveTempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('IXM-Tools-Archive-{0}' -f [guid]::NewGuid().ToString('N'))
 
 # -----------------------------------------------------------------------------
 # Console helpers
@@ -387,43 +403,338 @@ function New-SharedReader {
     }
 }
 
-function Get-DatedLogs {
+
+function Get-IxmBackupRoot {
+    param([AllowNull()][string]$ComponentRoot)
+
+    $Root = [string]$ComponentRoot
+    if ([string]::IsNullOrWhiteSpace($Root)) {
+        $Root = [string]$LogRoot
+    }
+    if ([string]::IsNullOrWhiteSpace($Root)) {
+        return $null
+    }
+
+    try {
+        $Normalized = $Root.TrimEnd('\')
+        $Leaf = Split-Path -Path $Normalized -Leaf
+        $Parent = Split-Path -Path $Normalized -Parent
+
+        if ($Leaf -ieq 'CSE' -and (Split-Path -Path $Parent -Leaf) -ieq 'uccse') {
+            $LogsRoot = Split-Path -Path $Parent -Parent
+        }
+        else {
+            $LogsRoot = $Parent
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$LogsRoot)) {
+            $Backup = Join-Path $LogsRoot 'Backup'
+            if (Test-Path -LiteralPath $Backup) {
+                return $Backup
+            }
+        }
+    }
+    catch {
+        Write-Verbose ('Unable to derive IX Messaging Backup directory from {0}: {1}' -f $Root,$_.Exception.Message)
+    }
+
+    try {
+        if (-not [string]::IsNullOrWhiteSpace([string]$LogRoot)) {
+            $LogsRoot = Split-Path -Path $LogRoot -Parent
+            $Backup = Join-Path $LogsRoot 'Backup'
+            if (Test-Path -LiteralPath $Backup) {
+                return $Backup
+            }
+        }
+    }
+    catch {
+        Write-Verbose ('Unable to derive IX Messaging Backup directory from VServer root: {0}' -f $_.Exception.Message)
+    }
+
+    return $null
+}
+
+function Get-IxmArchiveInventory {
     param(
-        [Parameter(Mandatory)][ValidateSet('STATUS','RVSIP','SIP')][string]$Type,
-        [Parameter(Mandatory)][datetime]$StartDate,
-        [Parameter(Mandatory)][datetime]$EndDate
+        [Parameter(Mandatory)]
+        [ValidateSet('VServer','DBCOM','CSE')]
+        [string]$ArchiveKind,
+
+        [AllowNull()][string]$ComponentRoot
     )
 
-    $Pattern = '^{0}#(?<Date>\d{{8}})\.log$' -f [regex]::Escape($Type)
-    $Results = New-Object System.Collections.Generic.List[object]
+    $BackupRoot = Get-IxmBackupRoot -ComponentRoot $ComponentRoot
+    if ([string]::IsNullOrWhiteSpace([string]$BackupRoot)) {
+        return @()
+    }
 
-    foreach ($File in Get-ChildItem -LiteralPath $LogRoot -File -ErrorAction SilentlyContinue) {
-        if ($File.Name -match $Pattern) {
-            try {
-                $Date = [datetime]::ParseExact(
-                    $Matches.Date,
-                    'yyyyMMdd',
-                    [System.Globalization.CultureInfo]::InvariantCulture
-                ).Date
+    $ZipFiles = @(
+        Get-ChildItem -LiteralPath $BackupRoot -File -Filter ('*-{0}.zip' -f $ArchiveKind) -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime,Name
+    )
 
-                if ($Date -ge $StartDate.Date -and $Date -le $EndDate.Date) {
-                    $Results.Add([pscustomobject]@{
-                        Type = $Type
-                        Date = $Date
-                        Name = $File.Name
-                        Path = $File.FullName
-                        Length = $File.Length
-                        LastWriteTime = $File.LastWriteTime
-                    })
+    if ($ZipFiles.Count -eq 0) {
+        return @()
+    }
+
+    $Signature = @(
+        $ZipFiles | ForEach-Object {
+            '{0}|{1}|{2}' -f $_.FullName,$_.Length,$_.LastWriteTimeUtc.Ticks
+        }
+    ) -join ';'
+
+    $CacheKey = ('{0}|{1}' -f $ArchiveKind,$BackupRoot).ToLowerInvariant()
+    if ($script:ArchiveIndexCache.ContainsKey($CacheKey)) {
+        $Cached = $script:ArchiveIndexCache[$CacheKey]
+        if ([string]$Cached.Signature -eq $Signature) {
+            return @($Cached.Items)
+        }
+    }
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    }
+    catch {
+        Write-Verbose ('ZIP support assembly could not be loaded: {0}' -f $_.Exception.Message)
+        return @()
+    }
+
+    $Items = New-Object System.Collections.Generic.List[object]
+
+    foreach ($ZipFile in $ZipFiles) {
+        $Archive = $null
+        try {
+            $Archive = [System.IO.Compression.ZipFile]::OpenRead($ZipFile.FullName)
+
+            foreach ($Entry in $Archive.Entries) {
+                if ([string]::IsNullOrWhiteSpace([string]$Entry.Name)) {
+                    continue
                 }
+
+                $EntryTime = $ZipFile.LastWriteTime
+                try {
+                    if ($null -ne $Entry.LastWriteTime) {
+                        $EntryTime = $Entry.LastWriteTime.LocalDateTime
+                    }
+                }
+                catch {
+                    Write-Verbose ('Unable to read ZIP entry timestamp for {0}: {1}' -f $Entry.FullName,$_.Exception.Message)
+                }
+
+                $Items.Add([pscustomobject]@{
+                    ArchiveKind = $ArchiveKind
+                    ArchivePath = $ZipFile.FullName
+                    ArchiveName = $ZipFile.Name
+                    ArchiveLastWriteTime = $ZipFile.LastWriteTime
+                    EntryFullName = $Entry.FullName
+                    Name = $Entry.Name
+                    Length = [int64]$Entry.Length
+                    LastWriteTime = $EntryTime
+                    Source = 'Archive'
+                })
             }
-            catch {
-                Write-Verbose ('Ignoring malformed dated filename: {0}' -f $_.Exception.Message)
+        }
+        catch {
+            Write-Verbose ('Unable to index backup ZIP {0}: {1}' -f $ZipFile.FullName,$_.Exception.Message)
+        }
+        finally {
+            if ($null -ne $Archive) {
+                $Archive.Dispose()
             }
         }
     }
 
-    return @($Results | Sort-Object Date,Name)
+    $Array = $Items.ToArray()
+    $script:ArchiveIndexCache[$CacheKey] = [pscustomobject]@{
+        Signature = $Signature
+        Items = $Array
+    }
+
+    return @($Array)
+}
+
+function Expand-IxmArchivedLogEntry {
+    param(
+        [Parameter(Mandatory)][ValidateSet('VServer','DBCOM','CSE')][string]$ArchiveKind,
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$EntryFullName,
+        [Parameter(Mandatory)][string]$EntryName,
+        [datetime]$LastWriteTime = [datetime]::MinValue
+    )
+
+    $CacheKey = ('{0}|{1}' -f $ArchivePath,$EntryFullName).ToLowerInvariant()
+    if ($script:ArchiveExtractCache.ContainsKey($CacheKey)) {
+        $CachedPath = [string]$script:ArchiveExtractCache[$CacheKey]
+        if (Test-Path -LiteralPath $CachedPath) {
+            return $CachedPath
+        }
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+
+    if (-not (Test-Path -LiteralPath $script:ArchiveTempRoot)) {
+        [void](New-Item -ItemType Directory -Path $script:ArchiveTempRoot -Force -ErrorAction Stop)
+    }
+
+    $ArchiveToken = [System.IO.Path]::GetFileNameWithoutExtension($ArchivePath)
+    $TargetDir = Join-Path $script:ArchiveTempRoot (Join-Path $ArchiveKind $ArchiveToken)
+    if (-not (Test-Path -LiteralPath $TargetDir)) {
+        [void](New-Item -ItemType Directory -Path $TargetDir -Force -ErrorAction Stop)
+    }
+
+    $SafeName = [System.IO.Path]::GetFileName($EntryName)
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        throw ('Archived entry has no usable filename: {0}' -f $EntryFullName)
+    }
+
+    $TargetPath = Join-Path $TargetDir $SafeName
+    if (Test-Path -LiteralPath $TargetPath) {
+        $script:ArchiveExtractCache[$CacheKey] = $TargetPath
+        return $TargetPath
+    }
+
+    $Archive = $null
+    $InputStream = $null
+    $OutputStream = $null
+
+    try {
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+        $Entry = $Archive.GetEntry($EntryFullName)
+
+        if ($null -eq $Entry) {
+            throw ('ZIP entry not found: {0}' -f $EntryFullName)
+        }
+
+        $InputStream = $Entry.Open()
+        $OutputStream = New-Object System.IO.FileStream -ArgumentList @(
+            $TargetPath,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+        $InputStream.CopyTo($OutputStream)
+    }
+    finally {
+        if ($null -ne $OutputStream) { $OutputStream.Dispose() }
+        if ($null -ne $InputStream) { $InputStream.Dispose() }
+        if ($null -ne $Archive) { $Archive.Dispose() }
+    }
+
+    if ($LastWriteTime -gt [datetime]::MinValue) {
+        try {
+            [System.IO.File]::SetLastWriteTime($TargetPath,$LastWriteTime)
+        }
+        catch {
+            Write-Verbose ('Unable to preserve timestamp on extracted archive log {0}: {1}' -f $TargetPath,$_.Exception.Message)
+        }
+    }
+
+    $script:ArchiveExtractCache[$CacheKey] = $TargetPath
+    Write-Host ('Using archived log: {0} [{1}]' -f $SafeName,[System.IO.Path]::GetFileName($ArchivePath)) -ForegroundColor DarkGray
+    return $TargetPath
+}
+
+function Remove-IxmArchiveTemp {
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:ArchiveTempRoot) -and
+        (Test-Path -LiteralPath $script:ArchiveTempRoot)) {
+        try {
+            Remove-Item -LiteralPath $script:ArchiveTempRoot -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose ('Unable to remove archive working directory {0}: {1}' -f $script:ArchiveTempRoot,$_.Exception.Message)
+        }
+    }
+
+    $script:ArchiveExtractCache = @{}
+}
+
+function Get-DatedLogs {
+    param(
+        [Parameter(Mandatory)][ValidateSet('STATUS','RVSIP','SIP')][string]$Type,
+        [Parameter(Mandatory)][datetime]$StartDate,
+        [Parameter(Mandatory)][datetime]$EndDate,
+        [switch]$MetadataOnly
+    )
+
+    $Pattern = '^{0}#(?<Date>\d{{8}})\.log$' -f [regex]::Escape($Type)
+    $Results = New-Object System.Collections.Generic.List[object]
+    $Seen = @{}
+
+    if (Test-Path -LiteralPath $LogRoot) {
+        foreach ($File in Get-ChildItem -LiteralPath $LogRoot -File -ErrorAction SilentlyContinue) {
+            if ($File.Name -match $Pattern) {
+                try {
+                    $Date = [datetime]::ParseExact($Matches.Date,'yyyyMMdd',[System.Globalization.CultureInfo]::InvariantCulture).Date
+
+                    if ($Date -ge $StartDate.Date -and $Date -le $EndDate.Date) {
+                        $Key = $File.Name.ToLowerInvariant()
+                        $Seen[$Key] = $true
+                        $Results.Add([pscustomobject]@{
+                            Type = $Type
+                            Date = $Date
+                            Name = $File.Name
+                            Path = $File.FullName
+                            Length = $File.Length
+                            LastWriteTime = $File.LastWriteTime
+                            Source = 'Live'
+                            Archive = ''
+                            ArchivePath = ''
+                            EntryFullName = ''
+                        })
+                    }
+                }
+                catch {
+                    Write-Verbose ('Ignoring malformed dated filename: {0}' -f $_.Exception.Message)
+                }
+            }
+        }
+    }
+
+    $ArchiveEntries = @(Get-IxmArchiveInventory -ArchiveKind VServer -ComponentRoot $LogRoot | Sort-Object ArchiveLastWriteTime -Descending)
+
+    foreach ($Entry in $ArchiveEntries) {
+        $Name = [string]$Entry.Name
+        if ($Name -notmatch $Pattern) { continue }
+
+        try {
+            $Date = [datetime]::ParseExact($Matches.Date,'yyyyMMdd',[System.Globalization.CultureInfo]::InvariantCulture).Date
+        }
+        catch {
+            continue
+        }
+
+        if ($Date -lt $StartDate.Date -or $Date -gt $EndDate.Date) { continue }
+
+        $Key = $Name.ToLowerInvariant()
+        if ($Seen.ContainsKey($Key)) { continue }
+
+        $Path = $null
+        if (-not $MetadataOnly) {
+            try {
+                $Path = Expand-IxmArchivedLogEntry -ArchiveKind VServer -ArchivePath $Entry.ArchivePath -EntryFullName $Entry.EntryFullName -EntryName $Entry.Name -LastWriteTime $Entry.LastWriteTime
+            }
+            catch {
+                Write-Warning ('Unable to read archived log {0} from {1}: {2}' -f $Name,$Entry.ArchiveName,$_.Exception.Message)
+                continue
+            }
+        }
+
+        $Seen[$Key] = $true
+        $Results.Add([pscustomobject]@{
+            Type = $Type
+            Date = $Date
+            Name = $Name
+            Path = $Path
+            Length = [int64]$Entry.Length
+            LastWriteTime = $Entry.LastWriteTime
+            Source = 'Archive'
+            Archive = $Entry.ArchiveName
+            ArchivePath = $Entry.ArchivePath
+            EntryFullName = $Entry.EntryFullName
+        })
+    }
+
+    return @($Results.ToArray() | Sort-Object Date,Name)
 }
 
 function Get-SearchCoverage {
@@ -437,15 +748,15 @@ function Get-SearchCoverage {
     $MaxDate = [datetime]'2999-12-31'
 
     $StatusDates = @(
-        Get-DatedLogs -Type STATUS -StartDate $MinDate -EndDate $MaxDate |
+        Get-DatedLogs -Type STATUS -StartDate $MinDate -EndDate $MaxDate -MetadataOnly |
         Where-Object { $_.Length -gt 0 } |
         ForEach-Object { $_.Date.Date } |
         Sort-Object -Unique
     )
 
     $MWILogObjects = @()
-    $MWILogObjects += @(Get-DatedLogs -Type RVSIP -StartDate $MinDate -EndDate $MaxDate)
-    $MWILogObjects += @(Get-DatedLogs -Type SIP -StartDate $MinDate -EndDate $MaxDate)
+    $MWILogObjects += @(Get-DatedLogs -Type RVSIP -StartDate $MinDate -EndDate $MaxDate -MetadataOnly)
+    $MWILogObjects += @(Get-DatedLogs -Type SIP -StartDate $MinDate -EndDate $MaxDate -MetadataOnly)
 
     $MWIDates = @(
         $MWILogObjects |
@@ -1397,6 +1708,7 @@ function Show-MailboxTimeline {
     return $Sorted
 }
 
+
 function Show-LogCoverage {
     param(
         [Parameter(Mandatory)][datetime]$StartDate,
@@ -1405,11 +1717,13 @@ function Show-LogCoverage {
 
     $Rows = New-Object System.Collections.Generic.List[object]
     foreach ($Type in @('STATUS','RVSIP','SIP')) {
-        foreach ($Log in @(Get-DatedLogs -Type $Type -StartDate $StartDate -EndDate $EndDate)) {
+        foreach ($Log in @(Get-DatedLogs -Type $Type -StartDate $StartDate -EndDate $EndDate -MetadataOnly)) {
             $Rows.Add([pscustomobject]@{
                 Date = $Log.Date.ToString('MM/dd/yyyy')
                 Type = $Type
+                Source = $Log.Source
                 File = $Log.Name
+                Archive = $Log.Archive
                 SizeMB = [math]::Round($Log.Length / 1MB, 2)
                 LastWrite = $Log.LastWriteTime
             })
@@ -1417,27 +1731,31 @@ function Show-LogCoverage {
     }
 
     if ($Rows.Count -eq 0) {
-        Write-Host 'No STATUS, SIP, or RVSIP logs were found for this date range.' -ForegroundColor Yellow
+        Write-Host 'No STATUS, SIP, or RVSIP logs were found in the live directories or VServer backup ZIPs for this date range.' -ForegroundColor Yellow
         return
     }
 
-    $Rows | Sort-Object Date,Type | Format-Table -AutoSize | Out-Host
+    $Rows.ToArray() | Sort-Object Date,Type | Format-Table -AutoSize | Out-Host
+
+    $ArchiveCount = @($Rows.ToArray() | Where-Object { $_.Source -eq 'Archive' }).Count
+    if ($ArchiveCount -gt 0) {
+        Write-Host ''
+        Write-Host ('Archive-backed files: {0}. Backup ZIP entries are included in search coverage.' -f $ArchiveCount) -ForegroundColor Green
+    }
 
     Write-Host ''
     Write-Host 'Important:' -ForegroundColor Yellow
-    Write-Host '  A day with no STATUS log cannot be treated as proof that no voicemail was left.' -ForegroundColor Yellow
-    Write-Host '  Results only describe activity visible in the retained log files above.' -ForegroundColor Yellow
+    Write-Host '  Live dated logs are preferred when both live and archived copies exist.' -ForegroundColor Yellow
+    Write-Host '  ZIP filenames such as 19-VServer.zip are not used to infer month/year; the dated log filename inside the ZIP is authoritative.' -ForegroundColor Yellow
+    Write-Host '  A day with no STATUS log in either source cannot be treated as proof that no voicemail was left.' -ForegroundColor Yellow
+    Write-Host '  Results only describe activity visible in the retained live or archived log files above.' -ForegroundColor Yellow
 }
-
-
-# -----------------------------------------------------------------------------
-# DBCOM Graph / email synchronization parser
-# -----------------------------------------------------------------------------
 
 function Get-DBComRoot {
     $Parent = Split-Path -Path $LogRoot -Parent
     return (Join-Path $Parent 'DBCOM')
 }
+
 
 function Get-DBComDatedLogs {
     param(
@@ -1446,13 +1764,11 @@ function Get-DBComDatedLogs {
         [string]$Type,
 
         [Parameter(Mandatory)][datetime]$StartDate,
-        [Parameter(Mandatory)][datetime]$EndDate
+        [Parameter(Mandatory)][datetime]$EndDate,
+        [switch]$MetadataOnly
     )
 
     $DBComRoot = Get-DBComRoot
-    if (-not (Test-Path -LiteralPath $DBComRoot)) {
-        return @()
-    }
 
     switch ($Type) {
         'EEAMHELPER' { $Prefix = 'EEAM_EEAMHELPER' }
@@ -1461,34 +1777,80 @@ function Get-DBComDatedLogs {
 
     $Pattern = '^{0}#(?<Date>\d{{8}})\.log$' -f [regex]::Escape($Prefix)
     $Results = New-Object System.Collections.Generic.List[object]
+    $Seen = @{}
 
-    foreach ($File in Get-ChildItem -LiteralPath $DBComRoot -File -ErrorAction SilentlyContinue) {
-        if ($File.Name -match $Pattern) {
-            try {
-                $Date = [datetime]::ParseExact(
-                    $Matches.Date,
-                    'yyyyMMdd',
-                    [System.Globalization.CultureInfo]::InvariantCulture
-                ).Date
-
-                if ($Date -ge $StartDate.Date -and $Date -le $EndDate.Date) {
-                    $Results.Add([pscustomobject]@{
-                        Type = $Type
-                        Date = $Date
-                        Name = $File.Name
-                        Path = $File.FullName
-                        Length = $File.Length
-                        LastWriteTime = $File.LastWriteTime
-                    })
+    if (Test-Path -LiteralPath $DBComRoot) {
+        foreach ($File in Get-ChildItem -LiteralPath $DBComRoot -File -ErrorAction SilentlyContinue) {
+            if ($File.Name -match $Pattern) {
+                try {
+                    $Date = [datetime]::ParseExact($Matches.Date,'yyyyMMdd',[System.Globalization.CultureInfo]::InvariantCulture).Date
+                    if ($Date -ge $StartDate.Date -and $Date -le $EndDate.Date) {
+                        $Key = $File.Name.ToLowerInvariant()
+                        $Seen[$Key] = $true
+                        $Results.Add([pscustomobject]@{
+                            Type = $Type
+                            Date = $Date
+                            Name = $File.Name
+                            Path = $File.FullName
+                            Length = $File.Length
+                            LastWriteTime = $File.LastWriteTime
+                            Source = 'Live'
+                            Archive = ''
+                            ArchivePath = ''
+                            EntryFullName = ''
+                        })
+                    }
                 }
-            }
-            catch {
-                Write-Verbose ('Ignoring malformed dated filename: {0}' -f $_.Exception.Message)
+                catch {
+                    Write-Verbose ('Ignoring malformed dated filename: {0}' -f $_.Exception.Message)
+                }
             }
         }
     }
 
-    return @($Results | Sort-Object Date,Name)
+    foreach ($Entry in @(Get-IxmArchiveInventory -ArchiveKind DBCOM -ComponentRoot $DBComRoot | Sort-Object ArchiveLastWriteTime -Descending)) {
+        $Name = [string]$Entry.Name
+        if ($Name -notmatch $Pattern) { continue }
+
+        try {
+            $Date = [datetime]::ParseExact($Matches.Date,'yyyyMMdd',[System.Globalization.CultureInfo]::InvariantCulture).Date
+        }
+        catch {
+            continue
+        }
+
+        if ($Date -lt $StartDate.Date -or $Date -gt $EndDate.Date) { continue }
+
+        $Key = $Name.ToLowerInvariant()
+        if ($Seen.ContainsKey($Key)) { continue }
+
+        $Path = $null
+        if (-not $MetadataOnly) {
+            try {
+                $Path = Expand-IxmArchivedLogEntry -ArchiveKind DBCOM -ArchivePath $Entry.ArchivePath -EntryFullName $Entry.EntryFullName -EntryName $Entry.Name -LastWriteTime $Entry.LastWriteTime
+            }
+            catch {
+                Write-Warning ('Unable to read archived DBCOM log {0} from {1}: {2}' -f $Name,$Entry.ArchiveName,$_.Exception.Message)
+                continue
+            }
+        }
+
+        $Seen[$Key] = $true
+        $Results.Add([pscustomobject]@{
+            Type = $Type
+            Date = $Date
+            Name = $Name
+            Path = $Path
+            Length = [int64]$Entry.Length
+            LastWriteTime = $Entry.LastWriteTime
+            Source = 'Archive'
+            Archive = $Entry.ArchiveName
+            ArchivePath = $Entry.ArchivePath
+            EntryFullName = $Entry.EntryFullName
+        })
+    }
+
+    return @($Results.ToArray() | Sort-Object Date,Name)
 }
 
 function Resolve-ExtensionMailboxIds {
@@ -3108,44 +3470,68 @@ function Resolve-CseGraphRoot {
     }
 }
 
+
 function Get-CseGraphErrorFileInventory {
     param([Parameter(Mandatory)][string]$CseRoot)
 
-    if (-not (Test-Path -LiteralPath $CseRoot)) {
-        return @()
-    }
-
     $Pattern = '^ERR\.SESGRFM\.(?<Date>\d{4}-\d{2}-\d{2})T(?<Hour>\d{2})\.csv$'
     $Results = New-Object System.Collections.Generic.List[object]
+    $Seen = @{}
 
-    foreach ($File in @(Get-ChildItem -LiteralPath $CseRoot -File -ErrorAction SilentlyContinue)) {
-        if ($File.Name -notmatch $Pattern) {
-            continue
+    if (Test-Path -LiteralPath $CseRoot) {
+        foreach ($File in @(Get-ChildItem -LiteralPath $CseRoot -File -ErrorAction SilentlyContinue)) {
+            if ($File.Name -notmatch $Pattern) { continue }
+
+            $StampText = ('{0} {1}' -f $Matches.Date,$Matches.Hour)
+            $Stamp = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact($StampText,'yyyy-MM-dd HH',[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::None,[ref]$Stamp)) {
+                continue
+            }
+
+            $Key = $File.Name.ToLowerInvariant()
+            $Seen[$Key] = $true
+            $Results.Add([pscustomobject]@{
+                Path = $File.FullName
+                Name = $File.Name
+                FileHour = $Stamp
+                Length = $File.Length
+                LastWriteTime = $File.LastWriteTime
+                Source = 'Live'
+                Archive = ''
+                ArchivePath = ''
+                EntryFullName = ''
+            })
         }
+    }
+
+    foreach ($Entry in @(Get-IxmArchiveInventory -ArchiveKind CSE -ComponentRoot $CseRoot | Sort-Object ArchiveLastWriteTime -Descending)) {
+        $Name = [string]$Entry.Name
+        if ($Name -notmatch $Pattern) { continue }
 
         $StampText = ('{0} {1}' -f $Matches.Date,$Matches.Hour)
         $Stamp = [datetime]::MinValue
-
-        if (-not [datetime]::TryParseExact(
-            $StampText,
-            'yyyy-MM-dd HH',
-            [System.Globalization.CultureInfo]::InvariantCulture,
-            [System.Globalization.DateTimeStyles]::None,
-            [ref]$Stamp
-        )) {
+        if (-not [datetime]::TryParseExact($StampText,'yyyy-MM-dd HH',[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::None,[ref]$Stamp)) {
             continue
         }
 
+        $Key = $Name.ToLowerInvariant()
+        if ($Seen.ContainsKey($Key)) { continue }
+
+        $Seen[$Key] = $true
         $Results.Add([pscustomobject]@{
-            Path = $File.FullName
-            Name = $File.Name
+            Path = $null
+            Name = $Name
             FileHour = $Stamp
-            Length = $File.Length
-            LastWriteTime = $File.LastWriteTime
+            Length = [int64]$Entry.Length
+            LastWriteTime = $Entry.LastWriteTime
+            Source = 'Archive'
+            Archive = $Entry.ArchiveName
+            ArchivePath = $Entry.ArchivePath
+            EntryFullName = $Entry.EntryFullName
         })
     }
 
-    return @($Results | Sort-Object FileHour,Name)
+    return @($Results.ToArray() | Sort-Object FileHour,Name)
 }
 
 function Read-CseGraphAuditRange {
@@ -3369,6 +3755,7 @@ function Get-CseGraphErrorInfo {
     }
 }
 
+
 function Get-CseGraphFailureEvents {
     param(
         [Parameter(Mandatory)][object[]]$Files
@@ -3382,33 +3769,37 @@ function Get-CseGraphFailureEvents {
 
     foreach ($File in @($Files | Sort-Object FileHour)) {
         $FileNumber++
-        Write-Progress `
-            -Activity 'Scanning Graph/CSE error logs' `
-            -Status ('{0} ({1}/{2})' -f $File.Name,$FileNumber,@($Files).Count) `
-            -PercentComplete (($FileNumber / [double]@($Files).Count) * 100)
+        Write-Progress -Activity 'Scanning Graph/CSE error logs' -Status ('{0} ({1}/{2})' -f $File.Name,$FileNumber,@($Files).Count) -PercentComplete (($FileNumber / [double]@($Files).Count) * 100)
 
-        $Lines = @(Get-Content -LiteralPath $File.Path -ErrorAction SilentlyContinue)
-        if ($Lines.Count -eq 0) {
-            continue
+        $ReadPath = [string]$File.Path
+        if ([string]$File.Source -eq 'Archive') {
+            try {
+                $ReadPath = Expand-IxmArchivedLogEntry -ArchiveKind CSE -ArchivePath $File.ArchivePath -EntryFullName $File.EntryFullName -EntryName $File.Name -LastWriteTime $File.LastWriteTime
+            }
+            catch {
+                Write-Warning ('Unable to read archived CSE log {0} from {1}: {2}' -f $File.Name,$File.Archive,$_.Exception.Message)
+                continue
+            }
         }
+
+        if ([string]::IsNullOrWhiteSpace($ReadPath) -or -not (Test-Path -LiteralPath $ReadPath)) { continue }
+
+        $Lines = @(Get-Content -LiteralPath $ReadPath -ErrorAction SilentlyContinue)
+        if ($Lines.Count -eq 0) { continue }
 
         $Starts = New-Object System.Collections.Generic.List[int]
 
         for ($i = 0; $i -lt $Lines.Count; $i++) {
             $Line = [string]$Lines[$i]
-
             if ($Line -match $SessionPattern -and $Line -match $ErrorPattern) {
                 $Starts.Add($i)
             }
         }
 
-        if ($Starts.Count -eq 0) {
-            continue
-        }
+        if ($Starts.Count -eq 0) { continue }
 
         for ($s = 0; $s -lt $Starts.Count; $s++) {
             $StartIndex = $Starts[$s]
-
             if ($s -lt ($Starts.Count - 1)) {
                 $EndIndex = $Starts[$s + 1] - 1
             }
@@ -3417,11 +3808,7 @@ function Get-CseGraphFailureEvents {
             }
 
             $FirstLine = [string]$Lines[$StartIndex]
-
-            # Re-run the session match so $Matches contains this event's session.
-            if ($FirstLine -notmatch $SessionPattern) {
-                continue
-            }
+            if ($FirstLine -notmatch $SessionPattern) { continue }
 
             $Extension = [string]$Matches.Extension
             $Folder = [string]$Matches.Folder
@@ -3433,9 +3820,16 @@ function Get-CseGraphFailureEvents {
                 $BlockLines = @($Lines[$StartIndex])
             }
 
-            $BlockText = ($BlockLines -join "`n")
+            $BlockText = ($BlockLines -join [Environment]::NewLine)
             $Info = Get-CseGraphErrorInfo -BlockText $BlockText
             $EventTime = Get-CseEventTime -FileHour $File.FileHour -Line $FirstLine
+
+            if ([string]$File.Source -eq 'Archive') {
+                $SourcePath = '{0}::{1}' -f $File.ArchivePath,$File.EntryFullName
+            }
+            else {
+                $SourcePath = $ReadPath
+            }
 
             $Events.Add([pscustomobject]@{
                 EventTime = $EventTime
@@ -3446,13 +3840,13 @@ function Get-CseGraphFailureEvents {
                 Classification = $Info.Classification
                 Recommendation = $Info.Recommendation
                 SourceFile = $File.Name
-                SourcePath = $File.Path
+                SourcePath = $SourcePath
             })
         }
     }
 
     Write-Progress -Activity 'Scanning Graph/CSE error logs' -Completed
-    return @($Events | Sort-Object EventTime,Extension)
+    return @($Events.ToArray() | Sort-Object EventTime,Extension)
 }
 
 function Get-CseAuditCoverageWindow {
